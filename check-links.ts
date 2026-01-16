@@ -51,17 +51,17 @@ async function checkLinkStatus(url: string): Promise<{ valid: boolean | null; re
       }
     }
 
-    // 百度网盘
+    // 百度网盘 - 使用重定向检测（更省流量）
     if (url.includes("pan.baidu.com") || url.includes("yun.baidu.com")) {
       const res = await fetch(url, {
-        headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" },
+        headers: {
+          "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 13_2_3 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/13.0.3 Mobile/15E148 Safari/604.1"
+        },
+        redirect: "manual",  // 不自动跟随重定向
       });
-      const html = await res.text();
-      if (html.includes("链接不存在") || html.includes("已失效") || html.includes("分享的文件已经被取消")) {
+      const location = res.headers.get("location") || "";
+      if (location.includes("error")) {
         return { valid: false, reason: "链接已失效" };
-      }
-      if (html.includes("过期") || html.includes("已过期")) {
-        return { valid: false, reason: "链接已过期" };
       }
       return { valid: true };
     }
