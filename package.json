@@ -1,7 +1,7 @@
 {
-  "name": "panlay-cron",
+  "name": "link-checker-bot",
   "version": "1.0.0",
-  "description": "网盘链接自动检测",
+  "description": "Automated link checker",
   "scripts": {
     "check": "npx tsx check-links.ts"
   },
