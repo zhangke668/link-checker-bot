@@ -78,16 +78,31 @@ async function checkLinkStatus(url: string): Promise<{ valid: boolean | null; re
   }
 }
 
+// 配置
+const MAX_LINKS_PER_RUN = 15000;  // 每次最多检测数量（约2.5小时）
+const DELAY_MS = 500;  // 每个链接间隔
+
 async function main() {
   console.log("========================================");
   console.log("开始检测链接状态");
   console.log("时间:", new Date().toISOString());
   console.log("========================================\n");
 
+  // 先获取总数
+  const { count: totalCount } = await supabase
+    .from("short_links")
+    .select("*", { count: "exact", head: true });
+
+  console.log(`数据库总链接数: ${totalCount}`);
+  console.log(`本次最多检测: ${MAX_LINKS_PER_RUN}`);
+  console.log(`预计耗时: ${Math.ceil((Math.min(totalCount || 0, MAX_LINKS_PER_RUN) * DELAY_MS) / 1000 / 60)} 分钟\n`);
+
+  // 按 last_checked 排序，最久没检测的优先
   const { data: links, error } = await supabase
     .from("short_links")
     .select("id, original_url, title, status, last_checked")
-    .order("last_checked", { ascending: true, nullsFirst: true });
+    .order("last_checked", { ascending: true, nullsFirst: true })
+    .limit(MAX_LINKS_PER_RUN);
 
   if (error) {
     console.error("获取链接失败:", error);
@@ -127,12 +142,16 @@ async function main() {
       console.log(`${progress} ! ${link.title || "未命名"} - 检测出错`);
     }
 
-    await new Promise((r) => setTimeout(r, 500));
+    await new Promise((r) => setTimeout(r, DELAY_MS));
   }
 
   console.log("\n========================================");
   console.log("检测完成");
+  console.log(`本次检测: ${links.length} 条`);
   console.log(`有效: ${valid} | 失效: ${expired} | 未知: ${unknown} | 错误: ${errors}`);
+  if (totalCount && totalCount > links.length) {
+    console.log(`剩余未检测: ${totalCount - links.length} 条（下次运行继续）`);
+  }
   console.log("========================================");
 }
 
