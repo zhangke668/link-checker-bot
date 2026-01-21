@@ -2,8 +2,8 @@ name: Fetch Trends
 
 on:
   schedule:
-    # 每小时的第5分钟运行
-    - cron: '5 * * * *'
+    - cron: '5 * * * *'   # 每小时第5分钟 (hourly)
+    - cron: '5 4 * * *'   # UTC 4:05 = 北京 12:05 (daily)
   workflow_dispatch:
   repository_dispatch:
     types: [fetch-trends]
@@ -12,8 +12,9 @@ jobs:
   fetch-hourly:
     runs-on: ubuntu-latest
     steps:
-      - name: Fetch hourly trends (软件、热度)
+      - name: Fetch hourly trends
         run: |
+          echo "Fetching hourly trends..."
           response=$(curl -s -w "\n%{http_code}" -X POST \
             "https://www.panlay.com/api/cron/fetch-trends?schedule=hourly" \
             -H "Authorization: Bearer ${{ secrets.CRON_SECRET }}" \
@@ -32,22 +33,22 @@ jobs:
 
   fetch-daily:
     runs-on: ubuntu-latest
-    # 只在 UTC 4:00 (北京时间 12:00) 运行每日任务
-    if: github.event.schedule == '5 4 * * *' || github.event_name == 'workflow_dispatch' || github.event_name == 'repository_dispatch'
     steps:
-      - name: Check if daily run time
-        id: check-time
+      - name: Check if should run daily
+        id: check
         run: |
           HOUR=$(date -u +%H)
+          echo "Current UTC hour: $HOUR"
           if [ "$HOUR" = "04" ] || [ "${{ github.event_name }}" = "workflow_dispatch" ] || [ "${{ github.event_name }}" = "repository_dispatch" ]; then
-            echo "run_daily=true" >> $GITHUB_OUTPUT
+            echo "should_run=true" >> $GITHUB_OUTPUT
           else
-            echo "run_daily=false" >> $GITHUB_OUTPUT
+            echo "should_run=false" >> $GITHUB_OUTPUT
           fi
 
-      - name: Fetch daily trends (影视、游戏)
-        if: steps.check-time.outputs.run_daily == 'true'
+      - name: Fetch daily trends
+        if: steps.check.outputs.should_run == 'true'
         run: |
+          echo "Fetching daily trends (豆瓣、猫眼、Steam等)..."
           response=$(curl -s -w "\n%{http_code}" -X POST \
             "https://www.panlay.com/api/cron/fetch-trends?schedule=daily" \
             -H "Authorization: Bearer ${{ secrets.CRON_SECRET }}" \
