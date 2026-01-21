@@ -13,6 +13,18 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY);
 const MAX_LINKS_PER_RUN = 15000;
 const CONCURRENCY = 20;
 const LINK_CHECK_TIMEOUT = 10000;
+const PLATFORM_ERROR_THRESHOLD = 10;  // 平台连续错误阈值
+
+// 平台错误计数器（用于检测 IP 被屏蔽）
+const platformErrorCounts: Record<string, number> = { quark: 0, baidu: 0 };
+const skippedPlatforms = new Set<string>();
+
+function getPlatform(url: string): string | null {
+  if (url.includes("quark.cn")) return "quark";
+  if (url.includes("pan.baidu.com") || url.includes("yun.baidu.com")) return "baidu";
+  if (url.includes("pan.xunlei.com")) return "xunlei";
+  return null;
+}
 
 const TABLES = [
   { name: "short_links", urlField: "original_url", statusField: "status", checkedField: "last_checked" },
@@ -82,15 +94,52 @@ async function checkBatch(links: Array<{ id: string; url: string; table: string;
   const results = await Promise.all(
     links.map(async (link, i) => {
       const progress = `[${startIndex + i + 1}/${totalCount}]`;
+      const platform = getPlatform(link.url);
+
+      // 检查平台是否已被跳过（IP 被屏蔽）
+      if (platform && skippedPlatforms.has(platform)) {
+        console.log(`${progress} ⊘ [${platform}] ${link.url.slice(0, 45)}... - 平台已跳过`);
+        return { status: "skipped", error: false };
+      }
+
       try {
         const result = await checkLinkStatus(link.url);
-        const status = result.valid === true ? "valid" : result.valid === false ? "expired" : "unchecked";
-        await supabase.from(link.table).update({ [link.statusField]: status, [link.checkedField]: new Date().toISOString() }).eq("id", link.id);
-        const icon = status === "valid" ? "✓" : status === "expired" ? "✗" : "?";
-        console.log(`${progress} ${icon} [${link.table}] ${link.url.slice(0, 50)}... - ${result.reason || status}`);
-        return { status, error: false };
+
+        if (result.valid === true) {
+          // 检测成功：有效
+          await supabase.from(link.table).update({ [link.statusField]: "valid", [link.checkedField]: new Date().toISOString() }).eq("id", link.id);
+          if (platform && platform in platformErrorCounts) platformErrorCounts[platform] = 0;
+          console.log(`${progress} ✓ [${platform}] ${link.url.slice(0, 45)}... - valid`);
+          return { status: "valid", error: false };
+        } else if (result.valid === false) {
+          // 检测成功：失效
+          await supabase.from(link.table).update({ [link.statusField]: "expired", [link.checkedField]: new Date().toISOString() }).eq("id", link.id);
+          if (platform && platform in platformErrorCounts) platformErrorCounts[platform] = 0;
+          console.log(`${progress} ✗ [${platform}] ${link.url.slice(0, 45)}... - ${result.reason || "expired"}`);
+          return { status: "expired", error: false };
+        } else {
+          // 检测失败：保留原状态，只更新检测时间
+          await supabase.from(link.table).update({ [link.checkedField]: new Date().toISOString() }).eq("id", link.id);
+          if (platform && platform in platformErrorCounts) {
+            platformErrorCounts[platform]++;
+            if (platformErrorCounts[platform] >= PLATFORM_ERROR_THRESHOLD && !skippedPlatforms.has(platform)) {
+              skippedPlatforms.add(platform);
+              console.log(`\n⚠️  ${platform} 连续失败 ${platformErrorCounts[platform]} 次，IP可能被屏蔽，跳过后续检测\n`);
+            }
+          }
+          console.log(`${progress} ? [${platform}] ${link.url.slice(0, 45)}... - ${result.reason || "preserved"}`);
+          return { status: "preserved", error: false };
+        }
       } catch (e) {
-        console.log(`${progress} ! [${link.table}] ${link.url.slice(0, 50)}... - 检测出错`);
+        // 异常也计入平台错误
+        if (platform && platform in platformErrorCounts) {
+          platformErrorCounts[platform]++;
+          if (platformErrorCounts[platform] >= PLATFORM_ERROR_THRESHOLD && !skippedPlatforms.has(platform)) {
+            skippedPlatforms.add(platform);
+            console.log(`\n⚠️  ${platform} 连续失败 ${platformErrorCounts[platform]} 次，IP可能被屏蔽，跳过后续检测\n`);
+          }
+        }
+        console.log(`${progress} ! [${platform}] ${link.url.slice(0, 45)}... - 检测异常`);
         return { status: "error", error: true };
       }
     })
@@ -149,7 +198,7 @@ async function main() {
 
   if (toCheck.length === 0) { console.log("没有需要检测的链接"); return; }
 
-  let valid = 0, expired = 0, unknown = 0, errors = 0;
+  let valid = 0, expired = 0, preserved = 0, skipped = 0, errors = 0;
 
   for (let i = 0; i < toCheck.length; i += CONCURRENCY) {
     const batch = toCheck.slice(i, i + CONCURRENCY);
@@ -158,7 +207,8 @@ async function main() {
       if (r.error) errors++;
       else if (r.status === "valid") valid++;
       else if (r.status === "expired") expired++;
-      else unknown++;
+      else if (r.status === "preserved") preserved++;
+      else if (r.status === "skipped") skipped++;
     }
     if (i + CONCURRENCY < toCheck.length) await new Promise((r) => setTimeout(r, 500));
   }
@@ -166,7 +216,10 @@ async function main() {
   console.log("\n========================================");
   console.log("检测完成");
   console.log(`本次检测: ${toCheck.length} 条`);
-  console.log(`有效: ${valid} | 失效: ${expired} | 未知: ${unknown} | 错误: ${errors}`);
+  console.log(`有效: ${valid} | 失效: ${expired} | 保留原状态: ${preserved} | 跳过: ${skipped} | 异常: ${errors}`);
+  if (skippedPlatforms.size > 0) {
+    console.log(`IP屏蔽跳过的平台: ${Array.from(skippedPlatforms).join(", ")}`);
+  }
   console.log("========================================");
 }
 
