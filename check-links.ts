@@ -10,7 +10,7 @@ if (!SUPABASE_URL || !SUPABASE_SERVICE_KEY) {
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY);
 
-const MAX_LINKS_PER_RUN = 5000;
+const MAX_LINKS_PER_RUN = 15000;
 const CONCURRENCY = 20;
 const LINK_CHECK_TIMEOUT = 10000;
 
@@ -110,12 +110,29 @@ async function main() {
   for (const table of TABLES) {
     const { count } = await supabase.from(table.name).select("*", { count: "exact", head: true });
     console.log(`${table.name} 表总数: ${count || 0}`);
-    const { data, error } = await supabase.from(table.name).select(`id, ${table.urlField}, ${table.checkedField}`).order(table.checkedField, { ascending: true, nullsFirst: true }).limit(MAX_LINKS_PER_RUN);
-    if (error) { console.error(`获取 ${table.name} 失败:`, error); continue; }
-    if (data) {
+
+    // 分页获取数据（Supabase 单次最多 1000 条）
+    const PAGE_SIZE = 1000;
+    let page = 0;
+    let hasMore = true;
+
+    while (hasMore && allLinks.length < MAX_LINKS_PER_RUN) {
+      const { data, error } = await supabase
+        .from(table.name)
+        .select(`id, ${table.urlField}, ${table.checkedField}`)
+        .order(table.checkedField, { ascending: true, nullsFirst: true })
+        .range(page * PAGE_SIZE, (page + 1) * PAGE_SIZE - 1);
+
+      if (error) { console.error(`获取 ${table.name} 失败:`, error); break; }
+      if (!data || data.length === 0) { hasMore = false; break; }
+
       for (const row of data) {
+        if (allLinks.length >= MAX_LINKS_PER_RUN) break;
         allLinks.push({ id: row.id, url: row[table.urlField], table: table.name, statusField: table.statusField, checkedField: table.checkedField, lastChecked: row[table.checkedField] });
       }
+
+      hasMore = data.length === PAGE_SIZE;
+      page++;
     }
   }
 
