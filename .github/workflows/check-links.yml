@@ -6,6 +6,8 @@ on:
     # 北京时间: 2:00, 5:00, 8:00, 11:00, 14:00, 17:00, 20:00, 23:00
     - cron: '0 */3 * * *'
   workflow_dispatch:
+  repository_dispatch:
+      types: [trigger]
 
 jobs:
   check:
