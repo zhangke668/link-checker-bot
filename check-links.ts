@@ -16,7 +16,7 @@ const LINK_CHECK_TIMEOUT = 10000;
 
 const TABLES = [
   { name: "short_links", urlField: "original_url", statusField: "status", checkedField: "last_checked" },
-  { name: "resources", urlField: "url", statusField: "status", checkedField: "last_checked" },
+  { name: "resources", urlField: "url", statusField: "status", checkedField: "last_checked_at" },
 ];
 
 async function fetchWithTimeout(url: string, options: RequestInit, timeout: number = LINK_CHECK_TIMEOUT): Promise<Response> {
