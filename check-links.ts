@@ -171,10 +171,11 @@ async function main() {
   const allLinks: LinkToCheck[] = [];
 
   for (const table of TABLES) {
-    const { count } = await supabase.from(table.name).select("*", { count: "exact", head: true });
-    console.log(`${table.name} 表总数: ${count || 0}`);
+    const { count: totalCount } = await supabase.from(table.name).select("*", { count: "exact", head: true });
+    const { count: expiredCount } = await supabase.from(table.name).select("*", { count: "exact", head: true }).eq(table.statusField, "expired");
+    console.log(`${table.name} 表总数: ${totalCount || 0}，已失效: ${expiredCount || 0}，待检测: ${(totalCount || 0) - (expiredCount || 0)}`);
 
-    // 分页获取数据（Supabase 单次最多 1000 条）
+    // 分页获取数据（Supabase 单次最多 1000 条），跳过已失效链接
     const PAGE_SIZE = 1000;
     let page = 0;
     let hasMore = true;
@@ -183,6 +184,7 @@ async function main() {
       const { data, error } = await supabase
         .from(table.name)
         .select(`id, ${table.urlField}, ${table.statusField}, ${table.checkedField}`)
+        .neq(table.statusField, "expired")
         .order(table.checkedField, { ascending: true, nullsFirst: true })
         .range(page * PAGE_SIZE, (page + 1) * PAGE_SIZE - 1);
 
