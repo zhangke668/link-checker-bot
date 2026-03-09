@@ -331,7 +331,7 @@ async function initXunleiAccount(): Promise<boolean> {
     return false;
   }
 
-  const accountId = process.env.XUNLEI_CHECKER_ACCOUNT_ID || "a4286769-6e2b-471c-a88f-9e891927acf7";
+  const accountId = process.env.XUNLEI_CHECKER_ACCOUNT_ID || "825d60c9-6618-4448-b2fd-7d558d0dfd6c";
   const { data, error } = await supabase.from("pan_accounts").select("id, account_id, credentials").eq("id", accountId).single();
   if (error || !data) {
     console.log("⚠️ 迅雷检测账号不存在，跳过迅雷链接检测");
