@@ -36,7 +36,7 @@ async function checkLinkStatus(url: string): Promise<{ valid: boolean | null; re
   try {
     if (url.includes("quark.cn")) return await checkQuarkLink(url);
     if (url.includes("pan.baidu.com") || url.includes("yun.baidu.com")) return await checkBaiduLink(url);
-    if (url.includes("pan.xunlei.com")) return await checkXunleiLink(url);
+    if (url.includes("pan.xunlei.com")) return { valid: null, reason: "迅雷暂不支持检测" };
     return { valid: null, reason: "不支持的网盘类型" };
   } catch (error) {
     if (error instanceof Error && error.name === "AbortError") return { valid: null, reason: "检测超时" };
