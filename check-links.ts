@@ -13,22 +13,11 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY);
 const MAX_LINKS_PER_RUN = 15000;
 const CONCURRENCY = 20;
 const LINK_CHECK_TIMEOUT = 10000;
-const PLATFORM_ERROR_THRESHOLD = 10;  // 平台连续错误阈值
-
-// 平台错误计数器（用于检测 IP 被屏蔽）
-const platformErrorCounts: Record<string, number> = { quark: 0, baidu: 0 };
-const skippedPlatforms = new Set<string>();
-
-function getPlatform(url: string): string | null {
-  if (url.includes("quark.cn")) return "quark";
-  if (url.includes("pan.baidu.com") || url.includes("yun.baidu.com")) return "baidu";
-  if (url.includes("pan.xunlei.com")) return "xunlei";
-  return null;
-}
+const BATCH_UPDATE_SIZE = 500; // 每批更新 500 条
 
 const TABLES = [
-  { name: "short_links", urlField: "original_url", statusField: "status", checkedField: "last_checked" },
-  { name: "resources", urlField: "url", statusField: "status", checkedField: "last_checked_at" },
+  { name: "short_links", urlField: "original_url", statusField: "status", checkedField: "last_checked", rpcName: "batch_update_short_link_status" },
+  { name: "resources", urlField: "url", statusField: "status", checkedField: "last_checked_at", rpcName: "batch_update_resource_status" },
 ];
 
 async function fetchWithTimeout(url: string, options: RequestInit, timeout: number = LINK_CHECK_TIMEOUT): Promise<Response> {
@@ -90,57 +79,81 @@ async function checkLinkStatus(url: string): Promise<{ valid: boolean | null; re
   }
 }
 
-async function checkBatch(links: Array<{ id: string; url: string; table: string; statusField: string; checkedField: string }>, startIndex: number, totalCount: number) {
+// 待批量更新的缓冲区，按表名分组
+const pendingUpdates: Map<string, { ids: string[]; statuses: string[]; rpcName: string }> = new Map();
+
+async function flushUpdates(tableName?: string) {
+  const tables = tableName ? [tableName] : [...pendingUpdates.keys()];
+  for (const name of tables) {
+    const pending = pendingUpdates.get(name);
+    if (!pending || pending.ids.length === 0) continue;
+
+    const { error } = await supabase.rpc(pending.rpcName, {
+      p_ids: pending.ids,
+      p_statuses: pending.statuses,
+      p_checked_at: new Date().toISOString(),
+    });
+
+    if (error) {
+      console.error(`批量更新 ${name} 失败 (${pending.ids.length} 条):`, error);
+    } else {
+      console.log(`  💾 批量更新 ${name}: ${pending.ids.length} 条`);
+    }
+
+    pending.ids = [];
+    pending.statuses = [];
+  }
+}
+
+async function queueUpdate(link: { id: string; table: string }, newStatus: string) {
+  let pending = pendingUpdates.get(link.table);
+  if (!pending) {
+    const tableConfig = TABLES.find(t => t.name === link.table)!;
+    pending = { ids: [], statuses: [], rpcName: tableConfig.rpcName };
+    pendingUpdates.set(link.table, pending);
+  }
+
+  pending.ids.push(link.id);
+  pending.statuses.push(newStatus);
+
+  // 达到批量大小，立即刷新
+  if (pending.ids.length >= BATCH_UPDATE_SIZE) {
+    await flushUpdates(link.table);
+  }
+}
+
+interface LinkToCheck {
+  id: string;
+  url: string;
+  table: string;
+  statusField: string;
+  checkedField: string;
+  lastChecked: string | null;
+  currentStatus: string | null;
+}
+
+async function checkBatch(links: LinkToCheck[], startIndex: number, totalCount: number) {
   const results = await Promise.all(
     links.map(async (link, i) => {
       const progress = `[${startIndex + i + 1}/${totalCount}]`;
-      const platform = getPlatform(link.url);
-
-      // 检查平台是否已被跳过（IP 被屏蔽）
-      if (platform && skippedPlatforms.has(platform)) {
-        console.log(`${progress} ⊘ [${platform}] ${link.url.slice(0, 45)}... - 平台已跳过`);
-        return { status: "skipped", error: false };
-      }
-
       try {
         const result = await checkLinkStatus(link.url);
+        const newStatus = result.valid === true ? "valid" : result.valid === false ? "expired" : "unchecked";
 
-        if (result.valid === true) {
-          // 检测成功：有效
-          await supabase.from(link.table).update({ [link.statusField]: "valid", [link.checkedField]: new Date().toISOString() }).eq("id", link.id);
-          if (platform && platform in platformErrorCounts) platformErrorCounts[platform] = 0;
-          console.log(`${progress} ✓ [${platform}] ${link.url.slice(0, 45)}... - valid`);
-          return { status: "valid", error: false };
-        } else if (result.valid === false) {
-          // 检测成功：失效
-          await supabase.from(link.table).update({ [link.statusField]: "expired", [link.checkedField]: new Date().toISOString() }).eq("id", link.id);
-          if (platform && platform in platformErrorCounts) platformErrorCounts[platform] = 0;
-          console.log(`${progress} ✗ [${platform}] ${link.url.slice(0, 45)}... - ${result.reason || "expired"}`);
-          return { status: "expired", error: false };
+        // 只在状态变化时才更新
+        if (newStatus !== link.currentStatus) {
+          await queueUpdate(link, newStatus);
+          const icon = newStatus === "valid" ? "✓" : newStatus === "expired" ? "✗" : "?";
+          console.log(`${progress} ${icon} [${link.table}] ${link.url.slice(0, 50)}... - ${link.currentStatus} → ${newStatus} (${result.reason || ""})`);
         } else {
-          // 检测失败：保留原状态，只更新检测时间
-          await supabase.from(link.table).update({ [link.checkedField]: new Date().toISOString() }).eq("id", link.id);
-          if (platform && platform in platformErrorCounts) {
-            platformErrorCounts[platform]++;
-            if (platformErrorCounts[platform] >= PLATFORM_ERROR_THRESHOLD && !skippedPlatforms.has(platform)) {
-              skippedPlatforms.add(platform);
-              console.log(`\n⚠️  ${platform} 连续失败 ${platformErrorCounts[platform]} 次，IP可能被屏蔽，跳过后续检测\n`);
-            }
-          }
-          console.log(`${progress} ? [${platform}] ${link.url.slice(0, 45)}... - ${result.reason || "preserved"}`);
-          return { status: "preserved", error: false };
+          // 状态没变，跳过更新
+          console.log(`${progress} = [${link.table}] ${link.url.slice(0, 50)}... - ${newStatus} (unchanged)`);
         }
+
+        return { status: newStatus, changed: newStatus !== link.currentStatus, error: false };
       } catch (e) {
-        // 异常也计入平台错误
-        if (platform && platform in platformErrorCounts) {
-          platformErrorCounts[platform]++;
-          if (platformErrorCounts[platform] >= PLATFORM_ERROR_THRESHOLD && !skippedPlatforms.has(platform)) {
-            skippedPlatforms.add(platform);
-            console.log(`\n⚠️  ${platform} 连续失败 ${platformErrorCounts[platform]} 次，IP可能被屏蔽，跳过后续检测\n`);
-          }
-        }
-        console.log(`${progress} ! [${platform}] ${link.url.slice(0, 45)}... - 检测异常`);
-        return { status: "error", error: true };
+        console.log(`${progress} ! [${link.table}] ${link.url.slice(0, 50)}... - 检测出错`);
+        return { status: "error", changed: false, error: true };
       }
     })
   );
@@ -149,12 +162,13 @@ async function checkBatch(links: Array<{ id: string; url: string; table: string;
 
 async function main() {
   console.log("========================================");
-  console.log("开始检测链接状态");
+  console.log("开始检测链接状态 (优化版: 跳过未变化 + 批量更新)");
   console.log("时间:", new Date().toISOString());
   console.log("并发数:", CONCURRENCY);
+  console.log("批量更新大小:", BATCH_UPDATE_SIZE);
   console.log("========================================\n");
 
-  const allLinks: Array<{ id: string; url: string; table: string; statusField: string; checkedField: string; lastChecked: string | null }> = [];
+  const allLinks: LinkToCheck[] = [];
 
   for (const table of TABLES) {
     const { count } = await supabase.from(table.name).select("*", { count: "exact", head: true });
@@ -168,7 +182,7 @@ async function main() {
     while (hasMore && allLinks.length < MAX_LINKS_PER_RUN) {
       const { data, error } = await supabase
         .from(table.name)
-        .select(`id, ${table.urlField}, ${table.checkedField}`)
+        .select(`id, ${table.urlField}, ${table.statusField}, ${table.checkedField}`)
         .order(table.checkedField, { ascending: true, nullsFirst: true })
         .range(page * PAGE_SIZE, (page + 1) * PAGE_SIZE - 1);
 
@@ -177,7 +191,15 @@ async function main() {
 
       for (const row of data) {
         if (allLinks.length >= MAX_LINKS_PER_RUN) break;
-        allLinks.push({ id: row.id, url: row[table.urlField], table: table.name, statusField: table.statusField, checkedField: table.checkedField, lastChecked: row[table.checkedField] });
+        allLinks.push({
+          id: row.id,
+          url: row[table.urlField],
+          table: table.name,
+          statusField: table.statusField,
+          checkedField: table.checkedField,
+          lastChecked: row[table.checkedField],
+          currentStatus: row[table.statusField],
+        });
       }
 
       hasMore = data.length === PAGE_SIZE;
@@ -198,7 +220,7 @@ async function main() {
 
   if (toCheck.length === 0) { console.log("没有需要检测的链接"); return; }
 
-  let valid = 0, expired = 0, preserved = 0, skipped = 0, errors = 0;
+  let valid = 0, expired = 0, unknown = 0, errors = 0, changed = 0, skipped = 0;
 
   for (let i = 0; i < toCheck.length; i += CONCURRENCY) {
     const batch = toCheck.slice(i, i + CONCURRENCY);
@@ -207,19 +229,22 @@ async function main() {
       if (r.error) errors++;
       else if (r.status === "valid") valid++;
       else if (r.status === "expired") expired++;
-      else if (r.status === "preserved") preserved++;
-      else if (r.status === "skipped") skipped++;
+      else unknown++;
+      if (r.changed) changed++;
+      else if (!r.error) skipped++;
     }
     if (i + CONCURRENCY < toCheck.length) await new Promise((r) => setTimeout(r, 500));
   }
 
+  // 刷新剩余的待更新数据
+  await flushUpdates();
+
   console.log("\n========================================");
   console.log("检测完成");
   console.log(`本次检测: ${toCheck.length} 条`);
-  console.log(`有效: ${valid} | 失效: ${expired} | 保留原状态: ${preserved} | 跳过: ${skipped} | 异常: ${errors}`);
-  if (skippedPlatforms.size > 0) {
-    console.log(`IP屏蔽跳过的平台: ${Array.from(skippedPlatforms).join(", ")}`);
-  }
+  console.log(`有效: ${valid} | 失效: ${expired} | 未知: ${unknown} | 错误: ${errors}`);
+  console.log(`状态变化: ${changed} | 跳过更新: ${skipped}`);
+  console.log(`API 调用节省: ${skipped} 次单独更新 → ${Math.ceil(changed / BATCH_UPDATE_SIZE)} 次批量更新`);
   console.log("========================================");
 }
 
