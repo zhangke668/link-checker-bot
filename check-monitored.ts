@@ -19,6 +19,10 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY);
 const CONCURRENCY = 10;
 const LINK_CHECK_TIMEOUT = 10000;
 
+function escapeHtml(str: string): string {
+  return str.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+}
+
 async function fetchWithTimeout(url: string, options: RequestInit, timeout: number = LINK_CHECK_TIMEOUT): Promise<Response> {
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), timeout);
@@ -124,10 +128,20 @@ async function main() {
       else if (newStatus === "expired") expired++;
       else unknown++;
 
+      const now = new Date().toISOString();
       await supabase
         .from("monitored_links")
-        .update({ status: newStatus, last_checked: new Date().toISOString() })
+        .update({ status: newStatus, last_checked: now })
         .eq("id", link.id);
+
+      // 同步状态到 short_links（同一用户、同一 URL）
+      if (newStatus === "valid" || newStatus === "expired") {
+        await supabase
+          .from("short_links")
+          .update({ status: newStatus, last_checked: now })
+          .eq("user_id", link.user_id)
+          .eq("original_url", link.url);
+      }
 
       if (newStatus !== link.status) {
         changed++;
@@ -169,7 +183,7 @@ async function main() {
         if (!expiredLinks || expiredLinks.length === 0) continue;
 
         const linkRows = expiredLinks
-          .map((l) => `<tr><td style="padding:6px 12px;border:1px solid #eee">${l.title || "未命名"}</td><td style="padding:6px 12px;border:1px solid #eee"><a href="${l.url}">${l.url}</a></td></tr>`)
+          .map((l) => `<tr><td style="padding:6px 12px;border:1px solid #eee">${escapeHtml(l.title || "未命名")}</td><td style="padding:6px 12px;border:1px solid #eee"><a href="${escapeHtml(l.url)}">${escapeHtml(l.url)}</a></td></tr>`)
           .join("");
 
         try {

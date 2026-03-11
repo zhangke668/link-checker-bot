@@ -17,6 +17,10 @@ const CONCURRENCY = 20;
 const LINK_CHECK_TIMEOUT = 10000;
 const BATCH_UPDATE_SIZE = 500; // 每批更新 500 条
 
+function escapeHtml(str: string): string {
+  return str.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+}
+
 const TABLES = [
   { name: "short_links", urlField: "original_url", statusField: "status", checkedField: "last_checked", rpcName: "batch_update_short_link_status" },
   { name: "resources", urlField: "url", statusField: "status", checkedField: "last_checked_at", rpcName: "batch_update_resource_status" },
@@ -519,6 +523,15 @@ async function checkBatch(links: LinkToCheck[], startIndex: number, totalCount: 
             list.push({ url: link.url, title: link.currentTitle });
             newlyExpiredByUser.set(link.userId, list);
           }
+
+          // 同步状态到 monitored_links（如果该用户有监控同一 URL）
+          if ((newStatus === "valid" || newStatus === "expired") && link.userId && link.table === "short_links") {
+            await supabase
+              .from("monitored_links")
+              .update({ status: newStatus, last_checked: new Date().toISOString() })
+              .eq("user_id", link.userId)
+              .eq("url", link.url);
+          }
         } else {
           console.log(`${progress} = [${link.table}] ${link.url.slice(0, 50)}... - ${newStatus} (unchanged)`);
         }
@@ -654,7 +667,7 @@ async function main() {
         if (!expiredLinks || expiredLinks.length === 0) continue;
 
         const linkRows = expiredLinks
-          .map((l) => `<tr><td style="padding:6px 12px;border:1px solid #eee">${l.title || "未命名"}</td><td style="padding:6px 12px;border:1px solid #eee"><a href="${l.url}">${l.url}</a></td></tr>`)
+          .map((l) => `<tr><td style="padding:6px 12px;border:1px solid #eee">${escapeHtml(l.title || "未命名")}</td><td style="padding:6px 12px;border:1px solid #eee"><a href="${escapeHtml(l.url)}">${escapeHtml(l.url)}</a></td></tr>`)
           .join("");
 
         try {
