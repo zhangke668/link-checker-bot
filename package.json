@@ -3,7 +3,8 @@
   "version": "1.0.0",
   "description": "Automated link checker",
   "scripts": {
-    "check": "npx tsx check-links.ts"
+    "check": "npx tsx check-links.ts",
+    "check-monitored": "npx tsx check-monitored.ts"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.39.0",
