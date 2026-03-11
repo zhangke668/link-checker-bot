@@ -655,7 +655,15 @@ async function main() {
 
     if (users && users.length > 0) {
       const QQ_DAILY_LIMIT = 99;
-      let qqSentCount = 0;
+
+      // 读取今天已发送数量
+      const today = new Date().toISOString().slice(0, 10);
+      const { data: todayCounts } = await supabase
+        .from("email_daily_counts")
+        .select("provider, count")
+        .eq("date", today);
+      let qqSentCount = todayCounts?.find((c: { provider: string }) => c.provider === "qq")?.count || 0;
+      console.log(`  今日已发送: QQ=${qqSentCount}, 163=${todayCounts?.find((c: { provider: string }) => c.provider === "163")?.count || 0}`);
 
       const qqTransporter = process.env.SMTP_PASSWORD ? createTransport({
         host: "smtp.qq.com", port: 465, secure: true,
@@ -707,6 +715,7 @@ async function main() {
           });
           emailsSent++;
           if (!useNetease) qqSentCount++;
+          await supabase.rpc("increment_email_count", { p_provider: useNetease ? "163" : "qq" });
           console.log(`  ✉️ [${provider}] 已通知 ${u.notification_email}（${expiredLinks.length} 个失效链接）`);
         } catch (e) {
           console.error(`  ❌ [${provider}] 发送失败 ${u.notification_email}:`, e);
@@ -720,6 +729,7 @@ async function main() {
                 html: emailHtml,
               });
               emailsSent++;
+              await supabase.rpc("increment_email_count", { p_provider: "163" });
               console.log(`  ✉️ [163备用] 已通知 ${u.notification_email}（${expiredLinks.length} 个失效链接）`);
             } catch (e2) {
               console.error(`  ❌ [163备用] 也失败 ${u.notification_email}:`, e2);
