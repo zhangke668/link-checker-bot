@@ -24,4 +24,6 @@ jobs:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
           SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+          SMTP_163_USER: ${{ secrets.SMTP_163_USER }}
+          SMTP_163_PASSWORD: ${{ secrets.SMTP_163_PASSWORD }}
         run: npm run check-monitored

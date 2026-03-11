@@ -644,7 +644,7 @@ async function main() {
 
   // ─── 邮件通知 ────────────────────────────────────────
   let emailsSent = 0;
-  if (newlyExpiredByUser.size > 0 && process.env.SMTP_PASSWORD) {
+  if (newlyExpiredByUser.size > 0 && (process.env.SMTP_PASSWORD || process.env.SMTP_163_PASSWORD)) {
     console.log(`\n📧 发送失效通知邮件...`);
     const userIds = [...newlyExpiredByUser.keys()];
     const { data: users } = await supabase
@@ -654,12 +654,19 @@ async function main() {
       .not("notification_email", "is", null);
 
     if (users && users.length > 0) {
-      const transporter = createTransport({
-        host: "smtp.qq.com",
-        port: 465,
-        secure: true,
+      const QQ_DAILY_LIMIT = 99;
+      let qqSentCount = 0;
+
+      const qqTransporter = process.env.SMTP_PASSWORD ? createTransport({
+        host: "smtp.qq.com", port: 465, secure: true,
         auth: { user: "panyouzhushou@foxmail.com", pass: process.env.SMTP_PASSWORD },
-      });
+      }) : null;
+
+      const neteaseUser = process.env.SMTP_163_USER || "ipwenan@163.com";
+      const neteaseTransporter = process.env.SMTP_163_PASSWORD ? createTransport({
+        host: "smtp.163.com", port: 465, secure: true,
+        auth: { user: neteaseUser, pass: process.env.SMTP_163_PASSWORD },
+      }) : null;
 
       for (const u of users) {
         if (!u.notification_email) continue;
@@ -670,12 +677,17 @@ async function main() {
           .map((l) => `<tr><td style="padding:6px 12px;border:1px solid #eee">${escapeHtml(l.title || "未命名")}</td><td style="padding:6px 12px;border:1px solid #eee"><a href="${escapeHtml(l.url)}">${escapeHtml(l.url)}</a></td></tr>`)
           .join("");
 
-        try {
-          await transporter.sendMail({
-            from: '"盘友助手" <panyouzhushou@foxmail.com>',
-            to: u.notification_email,
-            subject: `链接失效通知 - ${expiredLinks.length} 个链接已失效`,
-            html: `
+        const useNetease = qqSentCount >= QQ_DAILY_LIMIT || !qqTransporter;
+        const transporter = useNetease ? neteaseTransporter : qqTransporter;
+        const from = useNetease ? `"盘友助手" <${neteaseUser}>` : '"盘友助手" <panyouzhushou@foxmail.com>';
+        const provider = useNetease ? "163" : "QQ";
+
+        if (!transporter) {
+          console.error(`  ❌ 无可用邮箱通道，跳过 ${u.notification_email}`);
+          continue;
+        }
+
+        const emailHtml = `
               <div style="font-family:sans-serif;max-width:600px;margin:0 auto">
                 <h2 style="color:#333">链接失效通知</h2>
                 <p style="color:#666">检测到以下 ${expiredLinks.length} 个链接已失效，请及时处理：</p>
@@ -684,18 +696,40 @@ async function main() {
                   <tbody>${linkRows}</tbody>
                 </table>
                 <p style="color:#999;font-size:12px">此邮件由盘友助手自动发送，如不想收到通知请在链接检测页面关闭邮箱通知。</p>
-              </div>
-            `,
+              </div>`;
+
+        try {
+          await transporter.sendMail({
+            from,
+            to: u.notification_email,
+            subject: `链接失效通知 - ${expiredLinks.length} 个链接已失效`,
+            html: emailHtml,
           });
           emailsSent++;
-          console.log(`  ✉️ 已通知 ${u.notification_email}（${expiredLinks.length} 个失效链接）`);
+          if (!useNetease) qqSentCount++;
+          console.log(`  ✉️ [${provider}] 已通知 ${u.notification_email}（${expiredLinks.length} 个失效链接）`);
         } catch (e) {
-          console.error(`  ❌ 发送失败 ${u.notification_email}:`, e);
+          console.error(`  ❌ [${provider}] 发送失败 ${u.notification_email}:`, e);
+          // QQ 发送失败，尝试 163 备用
+          if (!useNetease && neteaseTransporter) {
+            try {
+              await neteaseTransporter.sendMail({
+                from: `"盘友助手" <${neteaseUser}>`,
+                to: u.notification_email,
+                subject: `链接失效通知 - ${expiredLinks.length} 个链接已失效`,
+                html: emailHtml,
+              });
+              emailsSent++;
+              console.log(`  ✉️ [163备用] 已通知 ${u.notification_email}（${expiredLinks.length} 个失效链接）`);
+            } catch (e2) {
+              console.error(`  ❌ [163备用] 也失败 ${u.notification_email}:`, e2);
+            }
+          }
         }
       }
     }
   } else if (newlyExpiredByUser.size > 0) {
-    console.log(`\n⚠️ 有 ${newlyExpiredByUser.size} 个用户的链接失效，但未配置 SMTP_PASSWORD，跳过邮件通知`);
+    console.log(`\n⚠️ 有 ${newlyExpiredByUser.size} 个用户的链接失效，但未配置邮箱通道，跳过邮件通知`);
   }
 
   console.log("\n========================================");

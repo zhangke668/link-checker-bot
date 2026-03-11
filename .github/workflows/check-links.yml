@@ -29,4 +29,6 @@ jobs:
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
           PAN_ENCRYPTION_KEY: ${{ secrets.PAN_ENCRYPTION_KEY }}
           SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+          SMTP_163_USER: ${{ secrets.SMTP_163_USER }}
+          SMTP_163_PASSWORD: ${{ secrets.SMTP_163_PASSWORD }}
         run: npm run check
