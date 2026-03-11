@@ -1,5 +1,6 @@
 import { createClient } from "@supabase/supabase-js";
 import { createHash, createCipheriv, createDecipheriv, randomBytes } from "crypto";
+import { createTransport } from "nodemailer";
 
 const SUPABASE_URL = process.env.SUPABASE_URL!;
 const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY!;
@@ -492,7 +493,11 @@ interface LinkToCheck {
   lastChecked: string | null;
   currentStatus: string | null;
   currentTitle: string | null;
+  userId: string | null;
 }
+
+// 新失效链接按用户分组
+const newlyExpiredByUser = new Map<string, { url: string; title: string | null }[]>();
 
 async function checkBatch(links: LinkToCheck[], startIndex: number, totalCount: number) {
   const results = await Promise.all(
@@ -507,6 +512,13 @@ async function checkBatch(links: LinkToCheck[], startIndex: number, totalCount: 
           await queueUpdate(link, newStatus);
           const icon = newStatus === "valid" ? "✓" : newStatus === "expired" ? "✗" : "?";
           console.log(`${progress} ${icon} [${link.table}] ${link.url.slice(0, 50)}... - ${link.currentStatus} → ${newStatus} (${result.reason || ""})`);
+
+          // 记录新失效链接（用于邮件通知）
+          if (newStatus === "expired" && link.userId) {
+            const list = newlyExpiredByUser.get(link.userId) || [];
+            list.push({ url: link.url, title: link.currentTitle });
+            newlyExpiredByUser.set(link.userId, list);
+          }
         } else {
           console.log(`${progress} = [${link.table}] ${link.url.slice(0, 50)}... - ${newStatus} (unchanged)`);
         }
@@ -555,7 +567,7 @@ async function main() {
     while (hasMore && allLinks.length < MAX_LINKS_PER_RUN) {
       const { data, error } = await supabase
         .from(table.name)
-        .select(`id, title, ${table.urlField}, ${table.statusField}, ${table.checkedField}`)
+        .select(`id, user_id, title, ${table.urlField}, ${table.statusField}, ${table.checkedField}`)
         .neq(table.statusField, "expired")
         .order(table.checkedField, { ascending: true, nullsFirst: true })
         .range(page * PAGE_SIZE, (page + 1) * PAGE_SIZE - 1);
@@ -574,6 +586,7 @@ async function main() {
           lastChecked: row[table.checkedField],
           currentStatus: row[table.statusField],
           currentTitle: row.title,
+          userId: row.user_id || null,
         });
       }
 
@@ -616,12 +629,69 @@ async function main() {
   await flushUpdates();
   await flushTitles();
 
+  // ─── 邮件通知 ────────────────────────────────────────
+  let emailsSent = 0;
+  if (newlyExpiredByUser.size > 0 && process.env.SMTP_PASSWORD) {
+    console.log(`\n📧 发送失效通知邮件...`);
+    const userIds = [...newlyExpiredByUser.keys()];
+    const { data: users } = await supabase
+      .from("users")
+      .select("id, notification_email")
+      .in("id", userIds)
+      .not("notification_email", "is", null);
+
+    if (users && users.length > 0) {
+      const transporter = createTransport({
+        host: "smtp.qq.com",
+        port: 465,
+        secure: true,
+        auth: { user: "panyouzhushou@foxmail.com", pass: process.env.SMTP_PASSWORD },
+      });
+
+      for (const u of users) {
+        if (!u.notification_email) continue;
+        const expiredLinks = newlyExpiredByUser.get(u.id);
+        if (!expiredLinks || expiredLinks.length === 0) continue;
+
+        const linkRows = expiredLinks
+          .map((l) => `<tr><td style="padding:6px 12px;border:1px solid #eee">${l.title || "未命名"}</td><td style="padding:6px 12px;border:1px solid #eee"><a href="${l.url}">${l.url}</a></td></tr>`)
+          .join("");
+
+        try {
+          await transporter.sendMail({
+            from: '"盘友助手" <panyouzhushou@foxmail.com>',
+            to: u.notification_email,
+            subject: `链接失效通知 - ${expiredLinks.length} 个链接已失效`,
+            html: `
+              <div style="font-family:sans-serif;max-width:600px;margin:0 auto">
+                <h2 style="color:#333">链接失效通知</h2>
+                <p style="color:#666">检测到以下 ${expiredLinks.length} 个链接已失效，请及时处理：</p>
+                <table style="border-collapse:collapse;width:100%;margin:16px 0">
+                  <thead><tr style="background:#f8f8f8"><th style="padding:8px 12px;border:1px solid #eee;text-align:left">资源名称</th><th style="padding:8px 12px;border:1px solid #eee;text-align:left">链接</th></tr></thead>
+                  <tbody>${linkRows}</tbody>
+                </table>
+                <p style="color:#999;font-size:12px">此邮件由盘友助手自动发送，如不想收到通知请在链接检测页面关闭邮箱通知。</p>
+              </div>
+            `,
+          });
+          emailsSent++;
+          console.log(`  ✉️ 已通知 ${u.notification_email}（${expiredLinks.length} 个失效链接）`);
+        } catch (e) {
+          console.error(`  ❌ 发送失败 ${u.notification_email}:`, e);
+        }
+      }
+    }
+  } else if (newlyExpiredByUser.size > 0) {
+    console.log(`\n⚠️ 有 ${newlyExpiredByUser.size} 个用户的链接失效，但未配置 SMTP_PASSWORD，跳过邮件通知`);
+  }
+
   console.log("\n========================================");
   console.log("检测完成");
   console.log(`本次检测: ${toCheck.length} 条`);
   console.log(`有效: ${valid} | 失效: ${expired} | 未知: ${unknown} | 错误: ${errors}`);
   console.log(`状态变化: ${changed} | 跳过更新: ${skipped}`);
   console.log(`标题更新: ${titleUpdated} 条默认标题被替换为真实标题`);
+  console.log(`邮件通知: ${emailsSent} 封`);
   console.log(`API 调用节省: ${skipped} 次单独更新 → ${Math.ceil(changed / BATCH_UPDATE_SIZE)} 次批量更新`);
   console.log("========================================");
 }

@@ -27,4 +27,6 @@ jobs:
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          PAN_ENCRYPTION_KEY: ${{ secrets.PAN_ENCRYPTION_KEY }}
+          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
         run: npm run check
