@@ -764,6 +764,62 @@ async function main() {
     console.log(`\n⚠️ 有 ${newlyExpiredByUser.size} 个用户的链接失效，但未配置邮箱通道，跳过邮件通知`);
   }
 
+  // ─── QQ 额度告警 ────────────────────────────────────────
+  {
+    const today = new Date().toISOString().slice(0, 10);
+    const { data: alertRow } = await supabase
+      .from("email_daily_counts")
+      .select("count")
+      .eq("date", today)
+      .eq("provider", "qq_alert")
+      .maybeSingle();
+    const alertAlreadySent = (alertRow?.count || 0) > 0;
+
+    const { data: latestCounts } = await supabase
+      .from("email_daily_counts")
+      .select("provider, count")
+      .eq("date", today);
+    const latestQQ1 = latestCounts?.find((c: { provider: string }) => c.provider === "qq")?.count || 0;
+    const latestQQ2 = latestCounts?.find((c: { provider: string }) => c.provider === "qq2")?.count || 0;
+
+    if (latestQQ1 >= 99 && latestQQ2 >= 99 && !alertAlreadySent) {
+      console.log("\n⚠️ QQ1+QQ2 额度已用完，发送告警邮件...");
+      const alertTransporter = (process.env.SMTP_PASSWORD ? createTransport({
+        host: "smtp.qq.com", port: 465, secure: true,
+        auth: { user: "panyouzhushou@foxmail.com", pass: process.env.SMTP_PASSWORD },
+      }) : null) || (process.env.SMTP_QQ2_PASSWORD ? createTransport({
+        host: "smtp.qq.com", port: 465, secure: true,
+        auth: { user: "panyouzhushou2@foxmail.com", pass: process.env.SMTP_QQ2_PASSWORD },
+      }) : null);
+
+      if (alertTransporter) {
+        try {
+          await alertTransporter.sendMail({
+            from: '"盘友助手告警" <panyouzhushou@foxmail.com>',
+            to: "775754012@qq.com",
+            subject: `⚠️ 邮件额度告警 - QQ邮箱额度已用完 (${today})`,
+            html: `
+              <div style="font-family:sans-serif;max-width:480px;margin:0 auto;padding:24px">
+                <h2 style="color:#dc2626">邮件额度告警</h2>
+                <p>今日 QQ 邮箱额度已全部用完：</p>
+                <ul>
+                  <li>QQ邮箱1 (panyouzhushou@foxmail.com): <b>${latestQQ1}/99</b></li>
+                  <li>QQ邮箱2 (panyouzhushou2@foxmail.com): <b>${latestQQ2}/99</b></li>
+                  <li>163邮箱剩余: <b>${Math.max(0, 50 - (latestCounts?.find((c: { provider: string }) => c.provider === "163")?.count || 0))}</b> 封</li>
+                </ul>
+                <p>后续邮件将通过 163 邮箱发送（剩余额度有限），请关注是否需要增加邮箱通道。</p>
+                <p style="color:#999;font-size:12px;margin-top:20px">此邮件由盘友助手系统自动发送</p>
+              </div>`,
+          });
+          await supabase.rpc("increment_email_count", { p_provider: "qq_alert" });
+          console.log("  ✉️ 告警邮件已发送到 775754012@qq.com");
+        } catch (e) {
+          console.error("  ❌ 告警邮件发送失败:", e);
+        }
+      }
+    }
+  }
+
   console.log("\n========================================");
   console.log("检测完成");
   console.log(`本次检测: ${toCheck.length} 条`);
