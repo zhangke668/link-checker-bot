@@ -662,12 +662,18 @@ async function main() {
         .from("email_daily_counts")
         .select("provider, count")
         .eq("date", today);
-      let qqSentCount = todayCounts?.find((c: { provider: string }) => c.provider === "qq")?.count || 0;
-      console.log(`  今日已发送: QQ=${qqSentCount}, 163=${todayCounts?.find((c: { provider: string }) => c.provider === "163")?.count || 0}`);
+      let qq1SentCount = todayCounts?.find((c: { provider: string }) => c.provider === "qq")?.count || 0;
+      let qq2SentCount = todayCounts?.find((c: { provider: string }) => c.provider === "qq2")?.count || 0;
+      console.log(`  今日已发送: QQ1=${qq1SentCount}, QQ2=${qq2SentCount}, 163=${todayCounts?.find((c: { provider: string }) => c.provider === "163")?.count || 0}`);
 
-      const qqTransporter = process.env.SMTP_PASSWORD ? createTransport({
+      const qq1Transporter = process.env.SMTP_PASSWORD ? createTransport({
         host: "smtp.qq.com", port: 465, secure: true,
         auth: { user: "panyouzhushou@foxmail.com", pass: process.env.SMTP_PASSWORD },
+      }) : null;
+
+      const qq2Transporter = process.env.SMTP_QQ2_PASSWORD ? createTransport({
+        host: "smtp.qq.com", port: 465, secure: true,
+        auth: { user: "panyouzhushou2@foxmail.com", pass: process.env.SMTP_QQ2_PASSWORD },
       }) : null;
 
       const neteaseUser = process.env.SMTP_163_USER || "ipwenan@163.com";
@@ -675,6 +681,20 @@ async function main() {
         host: "smtp.163.com", port: 465, secure: true,
         auth: { user: neteaseUser, pass: process.env.SMTP_163_PASSWORD },
       }) : null;
+
+      // 按优先级选择通道：QQ1 → QQ2 → 163
+      function pickChannel(): { transporter: typeof qq1Transporter; from: string; provider: string; providerKey: string } | null {
+        if (qq1Transporter && qq1SentCount < QQ_DAILY_LIMIT) {
+          return { transporter: qq1Transporter, from: '"盘友助手" <panyouzhushou@foxmail.com>', provider: "QQ1", providerKey: "qq" };
+        }
+        if (qq2Transporter && qq2SentCount < QQ_DAILY_LIMIT) {
+          return { transporter: qq2Transporter, from: '"盘友助手" <panyouzhushou2@foxmail.com>', provider: "QQ2", providerKey: "qq2" };
+        }
+        if (neteaseTransporter) {
+          return { transporter: neteaseTransporter, from: `"盘友助手" <${neteaseUser}>`, provider: "163", providerKey: "163" };
+        }
+        return null;
+      }
 
       for (const u of users) {
         if (!u.notification_email) continue;
@@ -684,16 +704,6 @@ async function main() {
         const linkRows = expiredLinks
           .map((l) => `<tr><td style="padding:6px 12px;border:1px solid #eee">${escapeHtml(l.title || "未命名")}</td><td style="padding:6px 12px;border:1px solid #eee"><a href="${escapeHtml(l.url)}">${escapeHtml(l.url)}</a></td></tr>`)
           .join("");
-
-        const useNetease = qqSentCount >= QQ_DAILY_LIMIT || !qqTransporter;
-        const transporter = useNetease ? neteaseTransporter : qqTransporter;
-        const from = useNetease ? `"盘友助手" <${neteaseUser}>` : '"盘友助手" <panyouzhushou@foxmail.com>';
-        const provider = useNetease ? "163" : "QQ";
-
-        if (!transporter) {
-          console.error(`  ❌ 无可用邮箱通道，跳过 ${u.notification_email}`);
-          continue;
-        }
 
         const emailHtml = `
               <div style="font-family:sans-serif;max-width:600px;margin:0 auto">
@@ -706,33 +716,45 @@ async function main() {
                 <p style="color:#999;font-size:12px">此邮件由盘友助手自动发送，如不想收到通知请在链接检测页面关闭邮箱通知。</p>
               </div>`;
 
+        const channel = pickChannel();
+        if (!channel || !channel.transporter) {
+          console.error(`  ❌ 无可用邮箱通道，跳过 ${u.notification_email}`);
+          continue;
+        }
+
         try {
-          await transporter.sendMail({
-            from,
+          await channel.transporter.sendMail({
+            from: channel.from,
             to: u.notification_email,
             subject: `链接失效通知 - ${expiredLinks.length} 个链接已失效`,
             html: emailHtml,
           });
           emailsSent++;
-          if (!useNetease) qqSentCount++;
-          await supabase.rpc("increment_email_count", { p_provider: useNetease ? "163" : "qq" });
-          console.log(`  ✉️ [${provider}] 已通知 ${u.notification_email}（${expiredLinks.length} 个失效链接）`);
+          if (channel.providerKey === "qq") qq1SentCount++;
+          else if (channel.providerKey === "qq2") qq2SentCount++;
+          await supabase.rpc("increment_email_count", { p_provider: channel.providerKey });
+          console.log(`  ✉️ [${channel.provider}] 已通知 ${u.notification_email}（${expiredLinks.length} 个失效链接）`);
         } catch (e) {
-          console.error(`  ❌ [${provider}] 发送失败 ${u.notification_email}:`, e);
-          // QQ 发送失败，尝试 163 备用
-          if (!useNetease && neteaseTransporter) {
+          console.error(`  ❌ [${channel.provider}] 发送失败 ${u.notification_email}:`, e);
+          // 当前通道失败，标记满额后重试
+          if (channel.providerKey === "qq") qq1SentCount = QQ_DAILY_LIMIT;
+          else if (channel.providerKey === "qq2") qq2SentCount = QQ_DAILY_LIMIT;
+          const fallback = pickChannel();
+          if (fallback && fallback.transporter) {
             try {
-              await neteaseTransporter.sendMail({
-                from: `"盘友助手" <${neteaseUser}>`,
+              await fallback.transporter.sendMail({
+                from: fallback.from,
                 to: u.notification_email,
                 subject: `链接失效通知 - ${expiredLinks.length} 个链接已失效`,
                 html: emailHtml,
               });
               emailsSent++;
-              await supabase.rpc("increment_email_count", { p_provider: "163" });
-              console.log(`  ✉️ [163备用] 已通知 ${u.notification_email}（${expiredLinks.length} 个失效链接）`);
+              if (fallback.providerKey === "qq") qq1SentCount++;
+              else if (fallback.providerKey === "qq2") qq2SentCount++;
+              await supabase.rpc("increment_email_count", { p_provider: fallback.providerKey });
+              console.log(`  ✉️ [${fallback.provider}备用] 已通知 ${u.notification_email}（${expiredLinks.length} 个失效链接）`);
             } catch (e2) {
-              console.error(`  ❌ [163备用] 也失败 ${u.notification_email}:`, e2);
+              console.error(`  ❌ [${fallback.provider}备用] 也失败 ${u.notification_email}:`, e2);
             }
           }
         }
