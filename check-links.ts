@@ -908,6 +908,59 @@ async function main() {
     }
   }
 
+  // ─── D1 读额度告警（>=90K 时通知） ────────────────────
+  const cfToken = process.env.CF_API_TOKEN;
+  const cfAccountId = process.env.CF_ACCOUNT_ID;
+  if (cfToken && cfAccountId) {
+    try {
+      const today = new Date().toISOString().split("T")[0];
+      const d1DatabaseId = "7ec59300-c62f-4a12-a62d-e9d6f3dd5c28";
+      const res = await fetch("https://api.cloudflare.com/client/v4/graphql", {
+        method: "POST",
+        headers: { Authorization: `Bearer ${cfToken}`, "Content-Type": "application/json" },
+        body: JSON.stringify({
+          query: `query ($accountTag: String!, $date: Date!, $dbId: String!) {
+            viewer { accounts(filter: { accountTag: $accountTag }) {
+              d1AnalyticsAdaptiveGroups(filter: { date_geq: $date, date_leq: $date, databaseId: $dbId }, limit: 10) {
+                sum { readQueries writeQueries }
+              }
+            }}
+          }`,
+          variables: { accountTag: cfAccountId, date: today, dbId: d1DatabaseId },
+        }),
+      });
+      if (res.ok) {
+        const data = await res.json();
+        const groups = data?.data?.viewer?.accounts?.[0]?.d1AnalyticsAdaptiveGroups || [];
+        let reads = 0, writes = 0;
+        for (const g of groups) { reads += g.sum?.readQueries || 0; writes += g.sum?.writeQueries || 0; }
+        console.log(`\nD1 今日额度: 读 ${reads.toLocaleString()}/100K, 写 ${writes.toLocaleString()}/100K`);
+
+        if (reads >= 90000 && process.env.SMTP_PASSWORD) {
+          const alertTransporter = createTransport({
+            host: "smtp.qq.com", port: 465, secure: true,
+            auth: { user: "panyouzhushou@foxmail.com", pass: process.env.SMTP_PASSWORD },
+          });
+          await alertTransporter.sendMail({
+            from: '"盘友助手告警" <panyouzhushou@foxmail.com>',
+            to: "775754012@qq.com",
+            subject: `⚠️ D1 读额度告警 - 今日已用 ${reads.toLocaleString()}/100,000 (${today})`,
+            html: `<div style="font-family:sans-serif;max-width:480px;margin:0 auto;padding:24px">
+              <h2 style="color:#dc2626">D1 读额度告警</h2>
+              <p>今日 D1 读操作已达 <b>${reads.toLocaleString()}</b> 次（上限 100,000）</p>
+              <p>写操作：<b>${writes.toLocaleString()}</b> 次</p>
+              <p>请检查是否有异常查询，必要时暂停链接检测 Cron。</p>
+              <p style="color:#999;font-size:12px;margin-top:20px">此邮件由盘友助手系统自动发送</p>
+            </div>`,
+          });
+          console.log("  ⚠️ D1 读额度告警邮件已发送");
+        }
+      }
+    } catch (e) {
+      console.error("D1 额度检查失败:", e);
+    }
+  }
+
   console.log("\n========================================");
   console.log("检测完成");
   console.log(`本次检测: ${toCheck.length} 条`);
