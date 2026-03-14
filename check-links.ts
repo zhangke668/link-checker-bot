@@ -4,13 +4,39 @@ import { createTransport } from "nodemailer";
 
 const SUPABASE_URL = process.env.SUPABASE_URL!;
 const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY!;
+const D1_WORKER_URL = process.env.D1_WORKER_URL || "https://s.panlay.com";
+const D1_API_KEY = process.env.CF_WORKER_API_KEY!;
 
 if (!SUPABASE_URL || !SUPABASE_SERVICE_KEY) {
   console.error("Missing SUPABASE_URL or SUPABASE_SERVICE_KEY");
   process.exit(1);
 }
+if (!D1_API_KEY) {
+  console.error("Missing CF_WORKER_API_KEY");
+  process.exit(1);
+}
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY);
+
+// D1 helper functions (resources 表已迁移到 D1)
+async function d1Query<T = Record<string, unknown>>(sql: string, params: unknown[] = []): Promise<{ rows: T[] }> {
+  const res = await fetch(`${D1_WORKER_URL}/api/d1`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Authorization: `Bearer ${D1_API_KEY}` },
+    body: JSON.stringify({ sql, params }),
+  });
+  if (!res.ok) throw new Error(`D1 query failed: ${res.status} ${await res.text()}`);
+  return res.json();
+}
+
+async function d1Batch(items: Array<{ sql: string; params?: unknown[] }>): Promise<void> {
+  const res = await fetch(`${D1_WORKER_URL}/api/d1`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Authorization: `Bearer ${D1_API_KEY}` },
+    body: JSON.stringify({ batch: items }),
+  });
+  if (!res.ok) throw new Error(`D1 batch failed: ${res.status} ${await res.text()}`);
+}
 
 const MAX_LINKS_PER_RUN = 15000;
 const CONCURRENCY = 20;
@@ -421,16 +447,32 @@ async function flushUpdates(tableName?: string) {
     const pending = pendingUpdates.get(name);
     if (!pending || pending.ids.length === 0) continue;
 
-    const { error } = await supabase.rpc(pending.rpcName, {
-      p_ids: pending.ids,
-      p_statuses: pending.statuses,
-      p_checked_at: new Date().toISOString(),
-    });
-
-    if (error) {
-      console.error(`批量更新 ${name} 失败 (${pending.ids.length} 条):`, error);
+    if (name === "resources") {
+      // resources 表在 D1
+      try {
+        const now = new Date().toISOString();
+        const items = pending.ids.map((id, i) => ({
+          sql: "UPDATE resources SET status = ?, last_checked_at = ? WHERE id = ?",
+          params: [pending.statuses[i], now, id],
+        }));
+        await d1Batch(items);
+        console.log(`  💾 批量更新 ${name} (D1): ${pending.ids.length} 条`);
+      } catch (e) {
+        console.error(`批量更新 ${name} (D1) 失败 (${pending.ids.length} 条):`, e);
+      }
     } else {
-      console.log(`  💾 批量更新 ${name}: ${pending.ids.length} 条`);
+      // short_links 等表仍在 Supabase
+      const { error } = await supabase.rpc(pending.rpcName, {
+        p_ids: pending.ids,
+        p_statuses: pending.statuses,
+        p_checked_at: new Date().toISOString(),
+      });
+
+      if (error) {
+        console.error(`批量更新 ${name} 失败 (${pending.ids.length} 条):`, error);
+      } else {
+        console.log(`  💾 批量更新 ${name}: ${pending.ids.length} 条`);
+      }
     }
 
     pending.ids = [];
@@ -461,15 +503,15 @@ const pendingTitles: { ids: string[]; titles: string[] } = { ids: [], titles: []
 async function flushTitles() {
   if (pendingTitles.ids.length === 0) return;
 
-  const { error } = await supabase.rpc("batch_update_resource_titles", {
-    p_ids: pendingTitles.ids,
-    p_titles: pendingTitles.titles,
-  });
-
-  if (error) {
-    console.error(`批量更新标题失败 (${pendingTitles.ids.length} 条):`, error);
-  } else {
-    console.log(`  📝 批量更新标题: ${pendingTitles.ids.length} 条`);
+  try {
+    const items = pendingTitles.ids.map((id, i) => ({
+      sql: "UPDATE resources SET title = ? WHERE id = ?",
+      params: [pendingTitles.titles[i], id],
+    }));
+    await d1Batch(items);
+    console.log(`  📝 批量更新标题 (D1): ${pendingTitles.ids.length} 条`);
+  } catch (e) {
+    console.error(`批量更新标题 (D1) 失败 (${pendingTitles.ids.length} 条):`, e);
   }
 
   pendingTitles.ids = [];
@@ -568,43 +610,83 @@ async function main() {
   const allLinks: LinkToCheck[] = [];
 
   for (const table of TABLES) {
-    const { count: totalCount } = await supabase.from(table.name).select("*", { count: "exact", head: true });
-    const { count: expiredCount } = await supabase.from(table.name).select("*", { count: "exact", head: true }).eq(table.statusField, "expired");
-    console.log(`${table.name} 表总数: ${totalCount || 0}，已失效: ${expiredCount || 0}，待检测: ${(totalCount || 0) - (expiredCount || 0)}`);
+    if (table.name === "resources") {
+      // resources 表从 D1 读取
+      const { rows: [{ c: totalCount }] } = await d1Query<{ c: number }>("SELECT COUNT(*) as c FROM resources");
+      const { rows: [{ c: expiredCount }] } = await d1Query<{ c: number }>("SELECT COUNT(*) as c FROM resources WHERE status = 'expired'");
+      console.log(`${table.name} 表总数: ${totalCount || 0}，已失效: ${expiredCount || 0}，待检测: ${(totalCount || 0) - (expiredCount || 0)}`);
 
-    // 分页获取数据（Supabase 单次最多 1000 条），跳过已失效链接
-    const PAGE_SIZE = 1000;
-    let page = 0;
-    let hasMore = true;
+      const PAGE_SIZE = 1000;
+      let cursor: string | null = null;
 
-    while (hasMore && allLinks.length < MAX_LINKS_PER_RUN) {
-      const { data, error } = await supabase
-        .from(table.name)
-        .select(`id, user_id, title, ${table.urlField}, ${table.statusField}, ${table.checkedField}`)
-        .neq(table.statusField, "expired")
-        .order(table.checkedField, { ascending: true, nullsFirst: true })
-        .range(page * PAGE_SIZE, (page + 1) * PAGE_SIZE - 1);
+      while (allLinks.length < MAX_LINKS_PER_RUN) {
+        const sql = cursor
+          ? "SELECT id, user_id, title, url, status, last_checked_at FROM resources WHERE status != 'expired' AND (last_checked_at IS NULL OR last_checked_at > ?) ORDER BY last_checked_at ASC NULLS FIRST LIMIT ?"
+          : "SELECT id, user_id, title, url, status, last_checked_at FROM resources WHERE status != 'expired' ORDER BY last_checked_at ASC NULLS FIRST LIMIT ?";
+        const params = cursor ? [cursor, PAGE_SIZE] : [PAGE_SIZE];
+        const { rows } = await d1Query<{ id: string; user_id: string | null; title: string | null; url: string; status: string; last_checked_at: string | null }>(sql, params);
 
-      if (error) { console.error(`获取 ${table.name} 失败:`, error); break; }
-      if (!data || data.length === 0) { hasMore = false; break; }
+        if (!rows || rows.length === 0) break;
 
-      for (const row of data) {
-        if (allLinks.length >= MAX_LINKS_PER_RUN) break;
-        allLinks.push({
-          id: row.id,
-          url: row[table.urlField],
-          table: table.name,
-          statusField: table.statusField,
-          checkedField: table.checkedField,
-          lastChecked: row[table.checkedField],
-          currentStatus: row[table.statusField],
-          currentTitle: row.title,
-          userId: row.user_id || null,
-        });
+        for (const row of rows) {
+          if (allLinks.length >= MAX_LINKS_PER_RUN) break;
+          allLinks.push({
+            id: row.id,
+            url: row.url,
+            table: table.name,
+            statusField: table.statusField,
+            checkedField: table.checkedField,
+            lastChecked: row.last_checked_at,
+            currentStatus: row.status,
+            currentTitle: row.title,
+            userId: row.user_id || null,
+          });
+        }
+
+        // 游标分页
+        const lastRow = rows[rows.length - 1];
+        if (!lastRow.last_checked_at || rows.length < PAGE_SIZE) break;
+        cursor = lastRow.last_checked_at;
       }
+    } else {
+      // short_links 等表从 Supabase 读取
+      const { count: totalCount } = await supabase.from(table.name).select("*", { count: "exact", head: true });
+      const { count: expiredCount } = await supabase.from(table.name).select("*", { count: "exact", head: true }).eq(table.statusField, "expired");
+      console.log(`${table.name} 表总数: ${totalCount || 0}，已失效: ${expiredCount || 0}，待检测: ${(totalCount || 0) - (expiredCount || 0)}`);
 
-      hasMore = data.length === PAGE_SIZE;
-      page++;
+      const PAGE_SIZE = 1000;
+      let page = 0;
+      let hasMore = true;
+
+      while (hasMore && allLinks.length < MAX_LINKS_PER_RUN) {
+        const { data, error } = await supabase
+          .from(table.name)
+          .select(`id, user_id, title, ${table.urlField}, ${table.statusField}, ${table.checkedField}`)
+          .neq(table.statusField, "expired")
+          .order(table.checkedField, { ascending: true, nullsFirst: true })
+          .range(page * PAGE_SIZE, (page + 1) * PAGE_SIZE - 1);
+
+        if (error) { console.error(`获取 ${table.name} 失败:`, error); break; }
+        if (!data || data.length === 0) { hasMore = false; break; }
+
+        for (const row of data) {
+          if (allLinks.length >= MAX_LINKS_PER_RUN) break;
+          allLinks.push({
+            id: row.id,
+            url: row[table.urlField],
+            table: table.name,
+            statusField: table.statusField,
+            checkedField: table.checkedField,
+            lastChecked: row[table.checkedField],
+            currentStatus: row[table.statusField],
+            currentTitle: row.title,
+            userId: row.user_id || null,
+          });
+        }
+
+        hasMore = data.length === PAGE_SIZE;
+        page++;
+      }
     }
   }
 
