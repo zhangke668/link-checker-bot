@@ -32,4 +32,5 @@ jobs:
           SMTP_QQ2_PASSWORD: ${{ secrets.SMTP_QQ2_PASSWORD }}
           SMTP_163_USER: ${{ secrets.SMTP_163_USER }}
           SMTP_163_PASSWORD: ${{ secrets.SMTP_163_PASSWORD }}
+          CF_WORKER_API_KEY: ${{ secrets.CF_WORKER_API_KEY }}
         run: npm run check
