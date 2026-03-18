@@ -617,14 +617,11 @@ async function main() {
       console.log(`${table.name} 表总数: ${totalCount || 0}，已失效: ${expiredCount || 0}，待检测: ${(totalCount || 0) - (expiredCount || 0)}`);
 
       const PAGE_SIZE = 1000;
-      let cursor: string | null = null;
+      let offset = 0;
 
       while (allLinks.length < MAX_LINKS_PER_RUN) {
-        const sql = cursor
-          ? "SELECT id, user_id, title, url, status, last_checked_at FROM resources WHERE status != 'expired' AND (last_checked_at IS NULL OR last_checked_at > ?) ORDER BY last_checked_at ASC NULLS FIRST LIMIT ?"
-          : "SELECT id, user_id, title, url, status, last_checked_at FROM resources WHERE status != 'expired' ORDER BY last_checked_at ASC NULLS FIRST LIMIT ?";
-        const params = cursor ? [cursor, PAGE_SIZE] : [PAGE_SIZE];
-        const { rows } = await d1Query<{ id: string; user_id: string | null; title: string | null; url: string; status: string; last_checked_at: string | null }>(sql, params);
+        const sql = "SELECT id, user_id, title, url, status, last_checked_at FROM resources WHERE status != 'expired' ORDER BY last_checked_at ASC NULLS FIRST LIMIT ? OFFSET ?";
+        const { rows } = await d1Query<{ id: string; user_id: string | null; title: string | null; url: string; status: string; last_checked_at: string | null }>(sql, [PAGE_SIZE, offset]);
 
         if (!rows || rows.length === 0) break;
 
@@ -643,10 +640,8 @@ async function main() {
           });
         }
 
-        // 游标分页
-        const lastRow = rows[rows.length - 1];
-        if (!lastRow.last_checked_at || rows.length < PAGE_SIZE) break;
-        cursor = lastRow.last_checked_at;
+        if (rows.length < PAGE_SIZE) break;
+        offset += PAGE_SIZE;
       }
     } else {
       // short_links 等表从 Supabase 读取
