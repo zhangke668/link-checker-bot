@@ -617,31 +617,37 @@ async function main() {
       console.log(`${table.name} 表总数: ${totalCount || 0}，已失效: ${expiredCount || 0}，待检测: ${(totalCount || 0) - (expiredCount || 0)}`);
 
       const PAGE_SIZE = 1000;
-      let offset = 0;
+      // 按状态分开查，利用 (status, last_checked_at) 复合索引，避免全表扫描
+      const ACTIVE_STATUSES = ["unchecked", "valid"];
 
-      while (allLinks.length < MAX_LINKS_PER_RUN) {
-        const sql = "SELECT id, user_id, title, url, status, last_checked_at FROM resources WHERE status != 'expired' ORDER BY last_checked_at ASC NULLS FIRST LIMIT ? OFFSET ?";
-        const { rows } = await d1Query<{ id: string; user_id: string | null; title: string | null; url: string; status: string; last_checked_at: string | null }>(sql, [PAGE_SIZE, offset]);
+      for (const st of ACTIVE_STATUSES) {
+        if (allLinks.length >= MAX_LINKS_PER_RUN) break;
+        let offset = 0;
 
-        if (!rows || rows.length === 0) break;
+        while (allLinks.length < MAX_LINKS_PER_RUN) {
+          const sql = "SELECT id, user_id, title, url, status, last_checked_at FROM resources WHERE status = ? ORDER BY last_checked_at ASC NULLS FIRST LIMIT ? OFFSET ?";
+          const { rows } = await d1Query<{ id: string; user_id: string | null; title: string | null; url: string; status: string; last_checked_at: string | null }>(sql, [st, PAGE_SIZE, offset]);
 
-        for (const row of rows) {
-          if (allLinks.length >= MAX_LINKS_PER_RUN) break;
-          allLinks.push({
-            id: row.id,
-            url: row.url,
-            table: table.name,
-            statusField: table.statusField,
-            checkedField: table.checkedField,
-            lastChecked: row.last_checked_at,
-            currentStatus: row.status,
-            currentTitle: row.title,
-            userId: row.user_id || null,
-          });
+          if (!rows || rows.length === 0) break;
+
+          for (const row of rows) {
+            if (allLinks.length >= MAX_LINKS_PER_RUN) break;
+            allLinks.push({
+              id: row.id,
+              url: row.url,
+              table: table.name,
+              statusField: table.statusField,
+              checkedField: table.checkedField,
+              lastChecked: row.last_checked_at,
+              currentStatus: row.status,
+              currentTitle: row.title,
+              userId: row.user_id || null,
+            });
+          }
+
+          if (rows.length < PAGE_SIZE) break;
+          offset += PAGE_SIZE;
         }
-
-        if (rows.length < PAGE_SIZE) break;
-        offset += PAGE_SIZE;
       }
     } else {
       // short_links 等表从 Supabase 读取
