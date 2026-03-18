@@ -624,22 +624,28 @@ async function main() {
         if (allLinks.length >= MAX_LINKS_PER_RUN) break;
         let cursorTime: string | null = null;
         let cursorId: string | null = null;
-        let isFirstPage = true;
+        let nullCursorId: string | null = null; // NULL 记录的游标（按 id 分页）
+        let nullPhase = true; // 是否还在查 NULL 记录
 
         while (allLinks.length < MAX_LINKS_PER_RUN) {
           let sql: string;
           let params: unknown[];
 
-          if (isFirstPage) {
-            // 第一页：先查 last_checked_at 为 NULL 的（未检测过的优先）
-            sql = "SELECT id, user_id, title, url, status, last_checked_at FROM resources WHERE status = ? AND last_checked_at IS NULL ORDER BY id ASC LIMIT ?";
-            params = [st, PAGE_SIZE];
+          if (nullPhase) {
+            // 查 last_checked_at 为 NULL 的（未检测过的优先），用 id 做游标
+            if (nullCursorId) {
+              sql = "SELECT id, user_id, title, url, status, last_checked_at FROM resources WHERE status = ? AND last_checked_at IS NULL AND id > ? ORDER BY id ASC LIMIT ?";
+              params = [st, nullCursorId, PAGE_SIZE];
+            } else {
+              sql = "SELECT id, user_id, title, url, status, last_checked_at FROM resources WHERE status = ? AND last_checked_at IS NULL ORDER BY id ASC LIMIT ?";
+              params = [st, PAGE_SIZE];
+            }
           } else if (cursorTime === null) {
-            // NULL 页读完了，开始读有时间戳的，从最早的开始
+            // NULL 阶段结束，开始查有时间戳的，从最早的开始
             sql = "SELECT id, user_id, title, url, status, last_checked_at FROM resources WHERE status = ? AND last_checked_at IS NOT NULL ORDER BY last_checked_at ASC, id ASC LIMIT ?";
             params = [st, PAGE_SIZE];
           } else {
-            // 游标分页：用 (last_checked_at, id) 双游标跳过已读记录
+            // 游标分页：用 (last_checked_at, id) 双游标
             sql = "SELECT id, user_id, title, url, status, last_checked_at FROM resources WHERE status = ? AND (last_checked_at > ? OR (last_checked_at = ? AND id > ?)) ORDER BY last_checked_at ASC, id ASC LIMIT ?";
             params = [st, cursorTime, cursorTime, cursorId, PAGE_SIZE];
           }
@@ -647,11 +653,7 @@ async function main() {
           const { rows } = await d1Query<{ id: string; user_id: string | null; title: string | null; url: string; status: string; last_checked_at: string | null }>(sql, params);
 
           if (!rows || rows.length === 0) {
-            if (isFirstPage) {
-              // NULL 页为空，继续查有时间戳的
-              isFirstPage = false;
-              continue;
-            }
+            if (nullPhase) { nullPhase = false; continue; }
             break;
           }
 
@@ -671,18 +673,14 @@ async function main() {
           }
 
           const lastRow = rows[rows.length - 1];
-          if (isFirstPage) {
-            // NULL 页读完，切换到有时间戳的页
-            if (rows.length < PAGE_SIZE) {
-              isFirstPage = false;
-              continue;
-            }
+          if (nullPhase) {
+            nullCursorId = lastRow.id;
+            if (rows.length < PAGE_SIZE) { nullPhase = false; continue; }
           } else {
             cursorTime = lastRow.last_checked_at;
             cursorId = lastRow.id;
+            if (rows.length < PAGE_SIZE) break;
           }
-
-          if (rows.length < PAGE_SIZE) break;
         }
       }
     } else {
