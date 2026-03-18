@@ -903,7 +903,7 @@ async function main() {
     }
   }
 
-  // ─── D1 读额度告警（>=90K 时通知） ────────────────────
+  // ─── D1 额度告警（读 >=4M 或 写 >=90K 时通知） ────────────────────
   const cfToken = process.env.CF_API_TOKEN;
   const cfAccountId = process.env.CF_ACCOUNT_ID;
   if (cfToken && cfAccountId) {
@@ -929,9 +929,12 @@ async function main() {
         const groups = data?.data?.viewer?.accounts?.[0]?.d1AnalyticsAdaptiveGroups || [];
         let reads = 0, writes = 0;
         for (const g of groups) { reads += g.sum?.readQueries || 0; writes += g.sum?.writeQueries || 0; }
-        console.log(`\nD1 今日额度: 读 ${reads.toLocaleString()}/100K, 写 ${writes.toLocaleString()}/100K`);
+        console.log(`\nD1 今日额度: 读 ${reads.toLocaleString()}/5M, 写 ${writes.toLocaleString()}/100K`);
 
-        if (reads >= 90000 && process.env.SMTP_PASSWORD) {
+        const readAlert = reads >= 4000000;
+        const writeAlert = writes >= 90000;
+        if ((readAlert || writeAlert) && process.env.SMTP_PASSWORD) {
+          const alertType = readAlert && writeAlert ? "读+写" : readAlert ? "读" : "写";
           const alertTransporter = createTransport({
             host: "smtp.qq.com", port: 465, secure: true,
             auth: { user: "panyouzhushou@foxmail.com", pass: process.env.SMTP_PASSWORD },
@@ -939,16 +942,16 @@ async function main() {
           await alertTransporter.sendMail({
             from: '"盘友助手告警" <panyouzhushou@foxmail.com>',
             to: "775754012@qq.com",
-            subject: `⚠️ D1 读额度告警 - 今日已用 ${reads.toLocaleString()}/100,000 (${today})`,
+            subject: `⚠️ D1 ${alertType}额度告警 (${today})`,
             html: `<div style="font-family:sans-serif;max-width:480px;margin:0 auto;padding:24px">
-              <h2 style="color:#dc2626">D1 读额度告警</h2>
-              <p>今日 D1 读操作已达 <b>${reads.toLocaleString()}</b> 次（上限 100,000）</p>
-              <p>写操作：<b>${writes.toLocaleString()}</b> 次</p>
+              <h2 style="color:#dc2626">D1 额度告警</h2>
+              <p>今日 D1 读操作：<b>${reads.toLocaleString()}</b> / 5,000,000${readAlert ? " ⚠️" : ""}</p>
+              <p>今日 D1 写操作：<b>${writes.toLocaleString()}</b> / 100,000${writeAlert ? " ⚠️" : ""}</p>
               <p>请检查是否有异常查询，必要时暂停链接检测 Cron。</p>
               <p style="color:#999;font-size:12px;margin-top:20px">此邮件由盘友助手系统自动发送</p>
             </div>`,
           });
-          console.log("  ⚠️ D1 读额度告警邮件已发送");
+          console.log(`  ⚠️ D1 ${alertType}额度告警邮件已发送`);
         }
       }
     } catch (e) {
