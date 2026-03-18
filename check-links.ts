@@ -617,18 +617,43 @@ async function main() {
       console.log(`${table.name} 表总数: ${totalCount || 0}，已失效: ${expiredCount || 0}，待检测: ${(totalCount || 0) - (expiredCount || 0)}`);
 
       const PAGE_SIZE = 1000;
-      // 按状态分开查，利用 (status, last_checked_at) 复合索引，避免全表扫描
+      // 按状态分开查 + 游标分页，利用 (status, last_checked_at, id) 索引，任意页都只扫描 PAGE_SIZE 行
       const ACTIVE_STATUSES = ["unchecked", "valid"];
 
       for (const st of ACTIVE_STATUSES) {
         if (allLinks.length >= MAX_LINKS_PER_RUN) break;
-        let offset = 0;
+        let cursorTime: string | null = null;
+        let cursorId: string | null = null;
+        let isFirstPage = true;
 
         while (allLinks.length < MAX_LINKS_PER_RUN) {
-          const sql = "SELECT id, user_id, title, url, status, last_checked_at FROM resources WHERE status = ? ORDER BY last_checked_at ASC NULLS FIRST LIMIT ? OFFSET ?";
-          const { rows } = await d1Query<{ id: string; user_id: string | null; title: string | null; url: string; status: string; last_checked_at: string | null }>(sql, [st, PAGE_SIZE, offset]);
+          let sql: string;
+          let params: unknown[];
 
-          if (!rows || rows.length === 0) break;
+          if (isFirstPage) {
+            // 第一页：先查 last_checked_at 为 NULL 的（未检测过的优先）
+            sql = "SELECT id, user_id, title, url, status, last_checked_at FROM resources WHERE status = ? AND last_checked_at IS NULL ORDER BY id ASC LIMIT ?";
+            params = [st, PAGE_SIZE];
+          } else if (cursorTime === null) {
+            // NULL 页读完了，开始读有时间戳的，从最早的开始
+            sql = "SELECT id, user_id, title, url, status, last_checked_at FROM resources WHERE status = ? AND last_checked_at IS NOT NULL ORDER BY last_checked_at ASC, id ASC LIMIT ?";
+            params = [st, PAGE_SIZE];
+          } else {
+            // 游标分页：用 (last_checked_at, id) 双游标跳过已读记录
+            sql = "SELECT id, user_id, title, url, status, last_checked_at FROM resources WHERE status = ? AND (last_checked_at > ? OR (last_checked_at = ? AND id > ?)) ORDER BY last_checked_at ASC, id ASC LIMIT ?";
+            params = [st, cursorTime, cursorTime, cursorId, PAGE_SIZE];
+          }
+
+          const { rows } = await d1Query<{ id: string; user_id: string | null; title: string | null; url: string; status: string; last_checked_at: string | null }>(sql, params);
+
+          if (!rows || rows.length === 0) {
+            if (isFirstPage) {
+              // NULL 页为空，继续查有时间戳的
+              isFirstPage = false;
+              continue;
+            }
+            break;
+          }
 
           for (const row of rows) {
             if (allLinks.length >= MAX_LINKS_PER_RUN) break;
@@ -645,8 +670,19 @@ async function main() {
             });
           }
 
+          const lastRow = rows[rows.length - 1];
+          if (isFirstPage) {
+            // NULL 页读完，切换到有时间戳的页
+            if (rows.length < PAGE_SIZE) {
+              isFirstPage = false;
+              continue;
+            }
+          } else {
+            cursorTime = lastRow.last_checked_at;
+            cursorId = lastRow.id;
+          }
+
           if (rows.length < PAGE_SIZE) break;
-          offset += PAGE_SIZE;
         }
       }
     } else {
