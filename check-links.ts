@@ -38,7 +38,7 @@ async function d1Batch(items: Array<{ sql: string; params?: unknown[] }>): Promi
   if (!res.ok) throw new Error(`D1 batch failed: ${res.status} ${await res.text()}`);
 }
 
-const MAX_LINKS_PER_RUN = 15000;
+const MAX_LINKS_PER_RUN = 100000;
 const CONCURRENCY = 20;
 const LINK_CHECK_TIMEOUT = 10000;
 const BATCH_UPDATE_SIZE = 500; // 每批更新 500 条
