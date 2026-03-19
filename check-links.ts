@@ -551,12 +551,18 @@ async function checkBatch(links: LinkToCheck[], startIndex: number, totalCount: 
       const progress = `[${startIndex + i + 1}/${totalCount}]`;
       try {
         const result = await checkLinkStatus(link.url);
-        const newStatus = result.valid === true ? "valid" : result.valid === false ? "expired" : "unchecked";
+        const newStatus = result.valid === true ? "valid" : result.valid === false ? "expired" : null;
+
+        if (!newStatus) {
+          // 检测超时/出错，保持原状态不变
+          console.log(`${progress} ? [${link.table}] ${link.url.slice(0, 50)}... - ${link.currentStatus} (${result.reason || "检测失败"})`);
+          return { status: link.currentStatus, changed: false, error: false };
+        }
 
         // 只在状态变化时才更新
         if (newStatus !== link.currentStatus) {
           await queueUpdate(link, newStatus);
-          const icon = newStatus === "valid" ? "✓" : newStatus === "expired" ? "✗" : "?";
+          const icon = newStatus === "valid" ? "✓" : "✗";
           console.log(`${progress} ${icon} [${link.table}] ${link.url.slice(0, 50)}... - ${link.currentStatus} → ${newStatus} (${result.reason || ""})`);
 
           // 记录新失效链接（用于邮件通知）
@@ -567,7 +573,7 @@ async function checkBatch(links: LinkToCheck[], startIndex: number, totalCount: 
           }
 
           // 同步状态到 monitored_links（如果该用户有监控同一 URL）
-          if ((newStatus === "valid" || newStatus === "expired") && link.userId && link.table === "short_links") {
+          if (link.userId && link.table === "short_links") {
             await supabase
               .from("monitored_links")
               .update({ status: newStatus, last_checked: new Date().toISOString() })
