@@ -122,30 +122,38 @@ async function main() {
     const batch = links.slice(i, i + CONCURRENCY);
     await Promise.all(batch.map(async (link) => {
       const result = await checkLinkStatus(link.url);
-      const newStatus = result.valid === true ? "valid" : result.valid === false ? "expired" : "unchecked";
+      const newStatus = result.valid === true ? "valid" : result.valid === false ? "expired" : null;
 
       if (newStatus === "valid") valid++;
       else if (newStatus === "expired") expired++;
       else unknown++;
 
       const now = new Date().toISOString();
-      await supabase
-        .from("monitored_links")
-        .update({ status: newStatus, last_checked: now })
-        .eq("id", link.id);
 
-      // 同步状态到 short_links（同一用户、同一 URL）
-      if (newStatus === "valid" || newStatus === "expired") {
+      if (newStatus) {
+        // 确认有效或失效，更新状态 + 检测时间
+        await supabase
+          .from("monitored_links")
+          .update({ status: newStatus, last_checked: now })
+          .eq("id", link.id);
+
+        // 同步到 short_links
         await supabase
           .from("short_links")
           .update({ status: newStatus, last_checked: now })
           .eq("user_id", link.user_id)
           .eq("original_url", link.url);
+      } else {
+        // 检测超时/出错，只更新检测时间，保持原状态不变
+        await supabase
+          .from("monitored_links")
+          .update({ last_checked: now })
+          .eq("id", link.id);
       }
 
-      if (newStatus !== link.status) {
+      if (newStatus && newStatus !== link.status) {
         changed++;
-        const icon = newStatus === "valid" ? "✓" : newStatus === "expired" ? "✗" : "?";
+        const icon = newStatus === "valid" ? "✓" : "✗";
         console.log(`${icon} ${link.url.slice(0, 60)}... ${link.status} → ${newStatus}`);
 
         if (newStatus === "expired" && link.status !== "expired") {
