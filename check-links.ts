@@ -18,40 +18,16 @@ if (!D1_API_KEY) {
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY);
 
-// D1 helper functions (resources 表已迁移到 D1)
-async function d1Query<T = Record<string, unknown>>(sql: string, params: unknown[] = []): Promise<{ rows: T[] }> {
-  const res = await fetch(`${D1_WORKER_URL}/api/d1`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json", Authorization: `Bearer ${D1_API_KEY}` },
-    body: JSON.stringify({ sql, params }),
-  });
-  if (!res.ok) throw new Error(`D1 query failed: ${res.status} ${await res.text()}`);
-  return res.json();
-}
-
-async function d1Batch(items: Array<{ sql: string; params?: unknown[] }>): Promise<void> {
-  const res = await fetch(`${D1_WORKER_URL}/api/d1`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json", Authorization: `Bearer ${D1_API_KEY}` },
-    body: JSON.stringify({ batch: items }),
-  });
-  if (!res.ok) throw new Error(`D1 batch failed: ${res.status} ${await res.text()}`);
-}
-
 const MAX_LINKS_PER_RUN = 50000;
 const CONCURRENCY = 20;
 const LINK_CHECK_TIMEOUT = 10000;
 const BATCH_UPDATE_SIZE = 500; // 每批更新 500 条
+const D1_TIMEOUT = 30000; // D1 请求超时 30 秒
 const EXCLUDED_URL_PATTERN = "%xunlei%"; // 迅雷暂不支持检测，查询阶段直接排除
 
 function escapeHtml(str: string): string {
   return str.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
 }
-
-const TABLES = [
-  { name: "short_links", urlField: "original_url", statusField: "status", checkedField: "last_checked", rpcName: "batch_update_short_link_status" },
-  { name: "resources", urlField: "url", statusField: "status", checkedField: "last_checked_at", rpcName: "batch_update_resource_status" },
-];
 
 async function fetchWithTimeout(url: string, options: RequestInit, timeout: number = LINK_CHECK_TIMEOUT): Promise<Response> {
   const controller = new AbortController();
@@ -62,6 +38,31 @@ async function fetchWithTimeout(url: string, options: RequestInit, timeout: numb
   } finally {
     clearTimeout(timeoutId);
   }
+}
+
+const TABLES = [
+  { name: "short_links", urlField: "original_url", statusField: "status", checkedField: "last_checked", rpcName: "batch_update_short_link_status" },
+  { name: "resources", urlField: "url", statusField: "status", checkedField: "last_checked_at", rpcName: "batch_update_resource_status" },
+];
+
+// D1 helper functions (resources 表已迁移到 D1)
+async function d1Query<T = Record<string, unknown>>(sql: string, params: unknown[] = []): Promise<{ rows: T[] }> {
+  const res = await fetchWithTimeout(`${D1_WORKER_URL}/api/d1`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Authorization: `Bearer ${D1_API_KEY}` },
+    body: JSON.stringify({ sql, params }),
+  }, D1_TIMEOUT);
+  if (!res.ok) throw new Error(`D1 query failed: ${res.status} ${await res.text()}`);
+  return res.json();
+}
+
+async function d1Batch(items: Array<{ sql: string; params?: unknown[] }>): Promise<void> {
+  const res = await fetchWithTimeout(`${D1_WORKER_URL}/api/d1`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Authorization: `Bearer ${D1_API_KEY}` },
+    body: JSON.stringify({ batch: items }),
+  }, D1_TIMEOUT);
+  if (!res.ok) throw new Error(`D1 batch failed: ${res.status} ${await res.text()}`);
 }
 
 async function checkLinkStatus(url: string): Promise<{ valid: boolean | null; reason?: string; title?: string }> {
