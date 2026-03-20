@@ -554,8 +554,9 @@ async function checkBatch(links: LinkToCheck[], startIndex: number, totalCount: 
         const newStatus = result.valid === true ? "valid" : result.valid === false ? "expired" : null;
 
         if (!newStatus) {
-          // 检测超时/出错，保持原状态不变
+          // 检测超时/出错，保持原状态不变，但更新 last_checked 防止同一条链接反复排在队列最前
           console.log(`${progress} ? [${link.table}] ${link.url.slice(0, 50)}... - ${link.currentStatus} (${result.reason || "检测失败"})`);
+          await queueUpdate(link, link.currentStatus || "unchecked");
           return { status: link.currentStatus, changed: false, error: false };
         }
 
@@ -640,19 +641,19 @@ async function main() {
           if (nullPhase) {
             // 查 last_checked_at 为 NULL 的（未检测过的优先），用 id 做游标
             if (nullCursorId) {
-              sql = "SELECT id, user_id, title, url, status, last_checked_at FROM resources WHERE status = ? AND last_checked_at IS NULL AND id > ? ORDER BY id ASC LIMIT ?";
+              sql = "SELECT id, user_id, title, url, status, last_checked_at FROM resources WHERE status = ? AND last_checked_at IS NULL AND url NOT LIKE '%xunlei%' AND id > ? ORDER BY id ASC LIMIT ?";
               params = [st, nullCursorId, PAGE_SIZE];
             } else {
-              sql = "SELECT id, user_id, title, url, status, last_checked_at FROM resources WHERE status = ? AND last_checked_at IS NULL ORDER BY id ASC LIMIT ?";
+              sql = "SELECT id, user_id, title, url, status, last_checked_at FROM resources WHERE status = ? AND last_checked_at IS NULL AND url NOT LIKE '%xunlei%' ORDER BY id ASC LIMIT ?";
               params = [st, PAGE_SIZE];
             }
           } else if (cursorTime === null) {
             // NULL 阶段结束，开始查有时间戳的，从最早的开始
-            sql = "SELECT id, user_id, title, url, status, last_checked_at FROM resources WHERE status = ? AND last_checked_at IS NOT NULL ORDER BY last_checked_at ASC, id ASC LIMIT ?";
+            sql = "SELECT id, user_id, title, url, status, last_checked_at FROM resources WHERE status = ? AND last_checked_at IS NOT NULL AND url NOT LIKE '%xunlei%' ORDER BY last_checked_at ASC, id ASC LIMIT ?";
             params = [st, PAGE_SIZE];
           } else {
             // 游标分页：用 (last_checked_at, id) 双游标
-            sql = "SELECT id, user_id, title, url, status, last_checked_at FROM resources WHERE status = ? AND (last_checked_at > ? OR (last_checked_at = ? AND id > ?)) ORDER BY last_checked_at ASC, id ASC LIMIT ?";
+            sql = "SELECT id, user_id, title, url, status, last_checked_at FROM resources WHERE status = ? AND url NOT LIKE '%xunlei%' AND (last_checked_at > ? OR (last_checked_at = ? AND id > ?)) ORDER BY last_checked_at ASC, id ASC LIMIT ?";
             params = [st, cursorTime, cursorTime, cursorId, PAGE_SIZE];
           }
 
@@ -704,6 +705,7 @@ async function main() {
           .from(table.name)
           .select(`id, user_id, title, ${table.urlField}, ${table.statusField}, ${table.checkedField}`)
           .neq(table.statusField, "expired")
+          .not(table.urlField, "like", "%xunlei%")
           .order(table.checkedField, { ascending: true, nullsFirst: true })
           .range(page * PAGE_SIZE, (page + 1) * PAGE_SIZE - 1);
 
