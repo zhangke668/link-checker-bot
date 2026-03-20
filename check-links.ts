@@ -582,6 +582,8 @@ async function checkBatch(links: LinkToCheck[], startIndex: number, totalCount: 
               .eq("url", link.url);
           }
         } else {
+          // 状态未变也更新 last_checked，让前端能看到最近检测时间
+          await queueUpdate(link, newStatus);
           console.log(`${progress} = [${link.table}] ${link.url.slice(0, 50)}... - ${newStatus} (unchanged)`);
         }
 
