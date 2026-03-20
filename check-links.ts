@@ -42,6 +42,7 @@ const MAX_LINKS_PER_RUN = 50000;
 const CONCURRENCY = 20;
 const LINK_CHECK_TIMEOUT = 10000;
 const BATCH_UPDATE_SIZE = 500; // 每批更新 500 条
+const EXCLUDED_URL_PATTERN = "%xunlei%"; // 迅雷暂不支持检测，查询阶段直接排除
 
 function escapeHtml(str: string): string {
   return str.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
@@ -560,9 +561,7 @@ async function checkBatch(links: LinkToCheck[], startIndex: number, totalCount: 
           return { status: link.currentStatus, changed: false, error: false };
         }
 
-        // 只在状态变化时才更新
         if (newStatus !== link.currentStatus) {
-          await queueUpdate(link, newStatus);
           const icon = newStatus === "valid" ? "✓" : "✗";
           console.log(`${progress} ${icon} [${link.table}] ${link.url.slice(0, 50)}... - ${link.currentStatus} → ${newStatus} (${result.reason || ""})`);
 
@@ -582,10 +581,11 @@ async function checkBatch(links: LinkToCheck[], startIndex: number, totalCount: 
               .eq("url", link.url);
           }
         } else {
-          // 状态未变也更新 last_checked，让前端能看到最近检测时间
-          await queueUpdate(link, newStatus);
           console.log(`${progress} = [${link.table}] ${link.url.slice(0, 50)}... - ${newStatus} (unchanged)`);
         }
+
+        // 无论状态是否变化都更新 last_checked
+        await queueUpdate(link, newStatus);
 
         // 默认标题 + 抓到了真实标题 → 更新标题
         if (result.title && link.currentTitle && DEFAULT_TITLES.includes(link.currentTitle) && link.table === "resources") {
@@ -643,19 +643,19 @@ async function main() {
           if (nullPhase) {
             // 查 last_checked_at 为 NULL 的（未检测过的优先），用 id 做游标
             if (nullCursorId) {
-              sql = "SELECT id, user_id, title, url, status, last_checked_at FROM resources WHERE status = ? AND last_checked_at IS NULL AND url NOT LIKE '%xunlei%' AND id > ? ORDER BY id ASC LIMIT ?";
+              sql = `SELECT id, user_id, title, url, status, last_checked_at FROM resources WHERE status = ? AND last_checked_at IS NULL AND url NOT LIKE '${EXCLUDED_URL_PATTERN}' AND id > ? ORDER BY id ASC LIMIT ?`;
               params = [st, nullCursorId, PAGE_SIZE];
             } else {
-              sql = "SELECT id, user_id, title, url, status, last_checked_at FROM resources WHERE status = ? AND last_checked_at IS NULL AND url NOT LIKE '%xunlei%' ORDER BY id ASC LIMIT ?";
+              sql = `SELECT id, user_id, title, url, status, last_checked_at FROM resources WHERE status = ? AND last_checked_at IS NULL AND url NOT LIKE '${EXCLUDED_URL_PATTERN}' ORDER BY id ASC LIMIT ?`;
               params = [st, PAGE_SIZE];
             }
           } else if (cursorTime === null) {
             // NULL 阶段结束，开始查有时间戳的，从最早的开始
-            sql = "SELECT id, user_id, title, url, status, last_checked_at FROM resources WHERE status = ? AND last_checked_at IS NOT NULL AND url NOT LIKE '%xunlei%' ORDER BY last_checked_at ASC, id ASC LIMIT ?";
+            sql = `SELECT id, user_id, title, url, status, last_checked_at FROM resources WHERE status = ? AND last_checked_at IS NOT NULL AND url NOT LIKE '${EXCLUDED_URL_PATTERN}' ORDER BY last_checked_at ASC, id ASC LIMIT ?`;
             params = [st, PAGE_SIZE];
           } else {
             // 游标分页：用 (last_checked_at, id) 双游标
-            sql = "SELECT id, user_id, title, url, status, last_checked_at FROM resources WHERE status = ? AND url NOT LIKE '%xunlei%' AND (last_checked_at > ? OR (last_checked_at = ? AND id > ?)) ORDER BY last_checked_at ASC, id ASC LIMIT ?";
+            sql = `SELECT id, user_id, title, url, status, last_checked_at FROM resources WHERE status = ? AND url NOT LIKE '${EXCLUDED_URL_PATTERN}' AND (last_checked_at > ? OR (last_checked_at = ? AND id > ?)) ORDER BY last_checked_at ASC, id ASC LIMIT ?`;
             params = [st, cursorTime, cursorTime, cursorId, PAGE_SIZE];
           }
 
@@ -707,7 +707,7 @@ async function main() {
           .from(table.name)
           .select(`id, user_id, title, ${table.urlField}, ${table.statusField}, ${table.checkedField}`)
           .neq(table.statusField, "expired")
-          .not(table.urlField, "like", "%xunlei%")
+          .not(table.urlField, "like", EXCLUDED_URL_PATTERN)
           .order(table.checkedField, { ascending: true, nullsFirst: true })
           .range(page * PAGE_SIZE, (page + 1) * PAGE_SIZE - 1);
 
