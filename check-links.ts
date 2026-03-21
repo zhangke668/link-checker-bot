@@ -622,9 +622,10 @@ async function main() {
   for (const table of TABLES) {
     if (table.name === "resources") {
       // resources 表从 D1 读取
-      const { rows: [{ c: totalCount }] } = await d1Query<{ c: number }>("SELECT COUNT(*) as c FROM resources");
-      const { rows: [{ c: expiredCount }] } = await d1Query<{ c: number }>("SELECT COUNT(*) as c FROM resources WHERE status = 'expired'");
-      console.log(`${table.name} 表总数: ${totalCount || 0}，已失效: ${expiredCount || 0}，待检测: ${(totalCount || 0) - (expiredCount || 0)}`);
+      const { rows: statusCounts } = await d1Query<{ status: string; c: number }>("SELECT status, COUNT(*) as c FROM resources GROUP BY status");
+      let totalCount = 0, expiredCount = 0;
+      for (const row of statusCounts) { totalCount += row.c; if (row.status === "expired") expiredCount = row.c; }
+      console.log(`${table.name} 表总数: ${totalCount}，已失效: ${expiredCount}，待检测: ${totalCount - expiredCount}`);
 
       const PAGE_SIZE = 1000;
       // 按状态分开查 + 游标分页，利用 (status, last_checked_at, id) 索引，任意页都只扫描 PAGE_SIZE 行
