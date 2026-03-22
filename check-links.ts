@@ -529,6 +529,42 @@ async function queueTitleUpdate(id: string, title: string) {
   }
 }
 
+async function markLinksNotified(links: { linkId: string; table: string }[]) {
+  const now = new Date().toISOString();
+  const d1Links: typeof links = [];
+  const supaLinks: typeof links = [];
+  for (const l of links) {
+    if (l.table === "resources") d1Links.push(l);
+    else if (l.table === "short_links") supaLinks.push(l);
+  }
+
+  if (d1Links.length > 0) {
+    try {
+      await d1Batch(d1Links.map(l => ({
+        sql: "UPDATE resources SET notified_at = ? WHERE id = ?",
+        params: [now, l.linkId],
+      })));
+      console.log(`  📌 标记 D1 notified_at: ${d1Links.length} 条`);
+    } catch (e) {
+      console.error("标记 D1 notified_at 失败:", e);
+    }
+  }
+
+  if (supaLinks.length > 0) {
+    try {
+      const ids = supaLinks.map(l => l.linkId);
+      const { error } = await supabase.from("short_links").update({ notified_at: now }).in("id", ids);
+      if (error) {
+        console.error("标记 short_links notified_at 失败:", error);
+      } else {
+        console.log(`  📌 标记 short_links notified_at: ${supaLinks.length} 条`);
+      }
+    } catch (e) {
+      console.error("标记 short_links notified_at 失败:", e);
+    }
+  }
+}
+
 const DEFAULT_TITLES = ["百度网盘资源", "夸克网盘资源", "迅雷网盘资源"];
 let titleUpdated = 0;
 
@@ -542,10 +578,11 @@ interface LinkToCheck {
   currentStatus: string | null;
   currentTitle: string | null;
   userId: string | null;
+  notifiedAt: string | null;
 }
 
 // 新失效链接按用户分组
-const newlyExpiredByUser = new Map<string, { url: string; title: string | null }[]>();
+const newlyExpiredByUser = new Map<string, { url: string; title: string | null; linkId: string; table: string }[]>();
 
 async function checkBatch(links: LinkToCheck[], startIndex: number, totalCount: number) {
   const results = await Promise.all(
@@ -566,10 +603,10 @@ async function checkBatch(links: LinkToCheck[], startIndex: number, totalCount: 
           const icon = newStatus === "valid" ? "✓" : "✗";
           console.log(`${progress} ${icon} [${link.table}] ${link.url.slice(0, 50)}... - ${link.currentStatus} → ${newStatus} (${result.reason || ""})`);
 
-          // 记录新失效链接（用于邮件通知）
-          if (newStatus === "expired" && link.userId) {
+          // 记录新失效链接（用于邮件通知），已通知过的不再通知
+          if (newStatus === "expired" && link.userId && !link.notifiedAt) {
             const list = newlyExpiredByUser.get(link.userId) || [];
-            list.push({ url: link.url, title: link.currentTitle });
+            list.push({ url: link.url, title: link.currentTitle, linkId: link.id, table: link.table });
             newlyExpiredByUser.set(link.userId, list);
           }
 
@@ -642,23 +679,23 @@ async function main() {
           if (nullPhase) {
             // 查 last_checked_at 为 NULL 的（未检测过的优先），用 id 做游标
             if (nullCursorId) {
-              sql = `SELECT id, user_id, title, url, status, last_checked_at FROM resources WHERE status = ? AND last_checked_at IS NULL AND url NOT LIKE '${EXCLUDED_URL_PATTERN}' AND id > ? ORDER BY id ASC LIMIT ?`;
-              params = [st, nullCursorId, PAGE_SIZE];
+              sql = "SELECT id, user_id, title, url, status, last_checked_at, notified_at FROM resources WHERE status = ? AND last_checked_at IS NULL AND url NOT LIKE ? AND id > ? ORDER BY id ASC LIMIT ?";
+              params = [st, EXCLUDED_URL_PATTERN, nullCursorId, PAGE_SIZE];
             } else {
-              sql = `SELECT id, user_id, title, url, status, last_checked_at FROM resources WHERE status = ? AND last_checked_at IS NULL AND url NOT LIKE '${EXCLUDED_URL_PATTERN}' ORDER BY id ASC LIMIT ?`;
-              params = [st, PAGE_SIZE];
+              sql = "SELECT id, user_id, title, url, status, last_checked_at, notified_at FROM resources WHERE status = ? AND last_checked_at IS NULL AND url NOT LIKE ? ORDER BY id ASC LIMIT ?";
+              params = [st, EXCLUDED_URL_PATTERN, PAGE_SIZE];
             }
           } else if (cursorTime === null) {
             // NULL 阶段结束，开始查有时间戳的，从最早的开始
-            sql = `SELECT id, user_id, title, url, status, last_checked_at FROM resources WHERE status = ? AND last_checked_at IS NOT NULL AND url NOT LIKE '${EXCLUDED_URL_PATTERN}' ORDER BY last_checked_at ASC, id ASC LIMIT ?`;
-            params = [st, PAGE_SIZE];
+            sql = "SELECT id, user_id, title, url, status, last_checked_at, notified_at FROM resources WHERE status = ? AND last_checked_at IS NOT NULL AND url NOT LIKE ? ORDER BY last_checked_at ASC, id ASC LIMIT ?";
+            params = [st, EXCLUDED_URL_PATTERN, PAGE_SIZE];
           } else {
             // 游标分页：用 (last_checked_at, id) 双游标
-            sql = `SELECT id, user_id, title, url, status, last_checked_at FROM resources WHERE status = ? AND url NOT LIKE '${EXCLUDED_URL_PATTERN}' AND (last_checked_at > ? OR (last_checked_at = ? AND id > ?)) ORDER BY last_checked_at ASC, id ASC LIMIT ?`;
-            params = [st, cursorTime, cursorTime, cursorId, PAGE_SIZE];
+            sql = "SELECT id, user_id, title, url, status, last_checked_at, notified_at FROM resources WHERE status = ? AND url NOT LIKE ? AND (last_checked_at > ? OR (last_checked_at = ? AND id > ?)) ORDER BY last_checked_at ASC, id ASC LIMIT ?";
+            params = [st, EXCLUDED_URL_PATTERN, cursorTime, cursorTime, cursorId, PAGE_SIZE];
           }
 
-          const { rows } = await d1Query<{ id: string; user_id: string | null; title: string | null; url: string; status: string; last_checked_at: string | null }>(sql, params);
+          const { rows } = await d1Query<{ id: string; user_id: string | null; title: string | null; url: string; status: string; last_checked_at: string | null; notified_at: string | null }>(sql, params);
 
           if (!rows || rows.length === 0) {
             if (nullPhase) { nullPhase = false; continue; }
@@ -677,6 +714,7 @@ async function main() {
               currentStatus: row.status,
               currentTitle: row.title,
               userId: row.user_id || null,
+              notifiedAt: row.notified_at || null,
             });
           }
 
@@ -704,7 +742,7 @@ async function main() {
       while (hasMore && allLinks.length < MAX_LINKS_PER_RUN) {
         const { data, error } = await supabase
           .from(table.name)
-          .select(`id, user_id, title, ${table.urlField}, ${table.statusField}, ${table.checkedField}`)
+          .select(`id, user_id, title, ${table.urlField}, ${table.statusField}, ${table.checkedField}, notified_at`)
           .neq(table.statusField, "expired")
           .not(table.urlField, "like", EXCLUDED_URL_PATTERN)
           .order(table.checkedField, { ascending: true, nullsFirst: true })
@@ -725,6 +763,7 @@ async function main() {
             currentStatus: row[table.statusField],
             currentTitle: row.title,
             userId: row.user_id || null,
+            notifiedAt: row.notified_at || null,
           });
         }
 
@@ -822,6 +861,8 @@ async function main() {
         return null;
       }
 
+      const notifiedLinks: { linkId: string; table: string }[] = [];
+
       for (const u of users) {
         if (!u.notification_email) continue;
         const expiredLinks = newlyExpiredByUser.get(u.id);
@@ -848,6 +889,7 @@ async function main() {
           continue;
         }
 
+        let sent = false;
         try {
           await channel.transporter.sendMail({
             from: channel.from,
@@ -859,6 +901,7 @@ async function main() {
           if (channel.providerKey === "qq") qq1SentCount++;
           else if (channel.providerKey === "qq2") qq2SentCount++;
           await supabase.rpc("increment_email_count", { p_provider: channel.providerKey });
+          sent = true;
           console.log(`  ✉️ [${channel.provider}] 已通知 ${u.notification_email}（${expiredLinks.length} 个失效链接）`);
         } catch (e) {
           console.error(`  ❌ [${channel.provider}] 发送失败 ${u.notification_email}:`, e);
@@ -878,12 +921,22 @@ async function main() {
               if (fallback.providerKey === "qq") qq1SentCount++;
               else if (fallback.providerKey === "qq2") qq2SentCount++;
               await supabase.rpc("increment_email_count", { p_provider: fallback.providerKey });
+              sent = true;
               console.log(`  ✉️ [${fallback.provider}备用] 已通知 ${u.notification_email}（${expiredLinks.length} 个失效链接）`);
             } catch (e2) {
               console.error(`  ❌ [${fallback.provider}备用] 也失败 ${u.notification_email}:`, e2);
             }
           }
         }
+
+        if (sent) {
+          notifiedLinks.push(...expiredLinks);
+        }
+      }
+
+      // 统一标记已通知，减少网络请求次数
+      if (notifiedLinks.length > 0) {
+        await markLinksNotified(notifiedLinks);
       }
     }
   } else if (newlyExpiredByUser.size > 0) {
