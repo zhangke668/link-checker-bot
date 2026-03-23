@@ -18,7 +18,7 @@ if (!D1_API_KEY) {
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY);
 
-const MAX_LINKS_PER_RUN = 50000;
+const MAX_LINKS_PER_RUN = 10000;
 const CONCURRENCY = 20;
 const LINK_CHECK_TIMEOUT = 10000;
 const BATCH_UPDATE_SIZE = 500; // 每批更新 500 条
