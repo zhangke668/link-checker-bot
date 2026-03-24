@@ -679,20 +679,20 @@ async function main() {
           if (nullPhase) {
             // 查 last_checked_at 为 NULL 的（未检测过的优先），用 id 做游标
             if (nullCursorId) {
-              sql = "SELECT id, user_id, title, url, status, last_checked_at, notified_at FROM resources WHERE status = ? AND last_checked_at IS NULL AND url NOT LIKE ? AND id > ? ORDER BY id ASC LIMIT ?";
-              params = [st, EXCLUDED_URL_PATTERN, nullCursorId, PAGE_SIZE];
+              sql = "SELECT id, user_id, title, url, status, last_checked_at, notified_at FROM resources WHERE status = ? AND last_checked_at IS NULL AND id > ? ORDER BY id ASC LIMIT ?";
+              params = [st, nullCursorId, PAGE_SIZE];
             } else {
-              sql = "SELECT id, user_id, title, url, status, last_checked_at, notified_at FROM resources WHERE status = ? AND last_checked_at IS NULL AND url NOT LIKE ? ORDER BY id ASC LIMIT ?";
-              params = [st, EXCLUDED_URL_PATTERN, PAGE_SIZE];
+              sql = "SELECT id, user_id, title, url, status, last_checked_at, notified_at FROM resources WHERE status = ? AND last_checked_at IS NULL ORDER BY id ASC LIMIT ?";
+              params = [st, PAGE_SIZE];
             }
           } else if (cursorTime === null) {
             // NULL 阶段结束，开始查有时间戳的，从最早的开始
-            sql = "SELECT id, user_id, title, url, status, last_checked_at, notified_at FROM resources WHERE status = ? AND last_checked_at IS NOT NULL AND url NOT LIKE ? ORDER BY last_checked_at ASC, id ASC LIMIT ?";
-            params = [st, EXCLUDED_URL_PATTERN, PAGE_SIZE];
+            sql = "SELECT id, user_id, title, url, status, last_checked_at, notified_at FROM resources WHERE status = ? AND last_checked_at IS NOT NULL ORDER BY last_checked_at ASC, id ASC LIMIT ?";
+            params = [st, PAGE_SIZE];
           } else {
             // 游标分页：用 (last_checked_at, id) 双游标
-            sql = "SELECT id, user_id, title, url, status, last_checked_at, notified_at FROM resources WHERE status = ? AND url NOT LIKE ? AND (last_checked_at > ? OR (last_checked_at = ? AND id > ?)) ORDER BY last_checked_at ASC, id ASC LIMIT ?";
-            params = [st, EXCLUDED_URL_PATTERN, cursorTime, cursorTime, cursorId, PAGE_SIZE];
+            sql = "SELECT id, user_id, title, url, status, last_checked_at, notified_at FROM resources WHERE status = ? AND (last_checked_at > ? OR (last_checked_at = ? AND id > ?)) ORDER BY last_checked_at ASC, id ASC LIMIT ?";
+            params = [st, cursorTime, cursorTime, cursorId, PAGE_SIZE];
           }
 
           const { rows } = await d1Query<{ id: string; user_id: string | null; title: string | null; url: string; status: string; last_checked_at: string | null; notified_at: string | null }>(sql, params);
@@ -704,6 +704,8 @@ async function main() {
 
           for (const row of rows) {
             if (allLinks.length >= MAX_LINKS_PER_RUN) break;
+            // 迅雷链接在代码层过滤（NOT LIKE 在 SQL 里会破坏索引效率）
+            if (row.url.includes("xunlei")) continue;
             allLinks.push({
               id: row.id,
               url: row.url,
