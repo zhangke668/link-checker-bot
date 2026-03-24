@@ -690,9 +690,9 @@ async function main() {
             sql = "SELECT id, user_id, title, url, status, last_checked_at, notified_at FROM resources WHERE status = ? AND last_checked_at IS NOT NULL ORDER BY last_checked_at ASC, id ASC LIMIT ?";
             params = [st, PAGE_SIZE];
           } else {
-            // 游标分页：用 (last_checked_at, id) 双游标
-            sql = "SELECT id, user_id, title, url, status, last_checked_at, notified_at FROM resources WHERE status = ? AND (last_checked_at > ? OR (last_checked_at = ? AND id > ?)) ORDER BY last_checked_at ASC, id ASC LIMIT ?";
-            params = [st, cursorTime, cursorTime, cursorId, PAGE_SIZE];
+            // 游标分页：用 last_checked_at > ? 简单游标（OR 条件会破坏索引效率）
+            sql = "SELECT id, user_id, title, url, status, last_checked_at, notified_at FROM resources WHERE status = ? AND last_checked_at > ? ORDER BY last_checked_at ASC, id ASC LIMIT ?";
+            params = [st, cursorTime, PAGE_SIZE];
           }
 
           const { rows } = await d1Query<{ id: string; user_id: string | null; title: string | null; url: string; status: string; last_checked_at: string | null; notified_at: string | null }>(sql, params);
