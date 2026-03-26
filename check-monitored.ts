@@ -4,6 +4,7 @@
  * 每小时半点由 GitHub Actions 触发
  */
 import { createClient } from "@supabase/supabase-js";
+import { createHash, randomBytes } from "crypto";
 import { createTransport } from "nodemailer";
 
 const SUPABASE_URL = process.env.SUPABASE_URL!;
@@ -16,7 +17,8 @@ if (!SUPABASE_URL || !SUPABASE_SERVICE_KEY) {
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY);
 
-const CONCURRENCY = 10;
+const CONCURRENCY = 20;
+const XUNLEI_CONCURRENCY = 5;
 const LINK_CHECK_TIMEOUT = 10000;
 
 function escapeHtml(str: string): string {
@@ -80,11 +82,111 @@ async function checkBaiduLink(url: string): Promise<{ valid: boolean | null; rea
   }
 }
 
+// ─── 迅雷匿名检测 ──────────────────────────────────────────
+// 常量同步自 frontend/src/lib/pan/xunlei-api.ts，更新时需同步
+
+const XUNLEI_CLIENT_ID = "Xqp0kJBXWhwaTpB6";
+const XUNLEI_CLIENT_VERSION = "1.92.36";
+const XUNLEI_PACKAGE_NAME = "pan.xunlei.com";
+const XUNLEI_CAPTCHA_SALTS = [
+  "QIBABOlpDvA2v0fKnj7XghyKAJcQg1iSnQXYF984",
+  "J1YUyz+VhaK8a2XLOw4",
+  "1Ijz+KAMo2EaEFBxuaWzWXDFc6elpw",
+  "gxvxtLin/vSdF4KpWDrsTG",
+  "aE5Pc6U3mwmysNxbUE",
+  "oEfQaxODSGv760DVHq1fHmamLPMmm9HXb/m",
+  "4neeDjxdgJiTcTen1E",
+  "SKyJtnf/5ECeLG1zzhL",
+  "J5NrxPsM7bSmLQ",
+  "hPueqITSMJhvb3JlMNK6CwKC",
+  "hosGF+0Xhhr",
+];
+
+const XUNLEI_USES_PER_TOKEN = 30;
+let xunleiCaptchaCache = { token: "", deviceId: "", expiry: 0, uses: 0 };
+let xunleiTokenRefreshInProgress: Promise<{ token: string; deviceId: string }> | null = null;
+let xunleiConsecutiveFailures = 0;
+const XUNLEI_MAX_CONSECUTIVE_FAILURES = 5;
+
+async function generateXunleiCaptchaToken(): Promise<{ token: string; deviceId: string }> {
+  const deviceId = randomBytes(32).toString("hex").substring(0, 32);
+  const timestamp = String(Date.now());
+  let str = XUNLEI_CLIENT_ID + XUNLEI_CLIENT_VERSION + XUNLEI_PACKAGE_NAME + deviceId + timestamp;
+  for (const salt of XUNLEI_CAPTCHA_SALTS) str = createHash("md5").update(str + salt).digest("hex");
+
+  const res = await fetchWithTimeout("https://xluser-ssl.xunlei.com/v1/shield/captcha/init", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      client_id: XUNLEI_CLIENT_ID,
+      action: "get:/drive/v1/files",
+      device_id: deviceId,
+      meta: { package_name: XUNLEI_PACKAGE_NAME, client_version: XUNLEI_CLIENT_VERSION, captcha_sign: "1." + str, timestamp, user_id: "0" },
+    }),
+  });
+  const data = await res.json() as Record<string, unknown>;
+  if (!data.captcha_token) throw new Error("captcha init 失败: " + ((data.error_description as string) || (data.error as string) || "unknown"));
+
+  xunleiCaptchaCache = { token: data.captcha_token as string, deviceId, expiry: Date.now() + 240000, uses: 1 };
+  return { token: xunleiCaptchaCache.token, deviceId };
+}
+
+async function getXunleiCaptchaToken(): Promise<{ token: string; deviceId: string }> {
+  if (xunleiCaptchaCache.token && Date.now() < xunleiCaptchaCache.expiry && xunleiCaptchaCache.uses < XUNLEI_USES_PER_TOKEN) {
+    xunleiCaptchaCache.uses++;
+    return { token: xunleiCaptchaCache.token, deviceId: xunleiCaptchaCache.deviceId };
+  }
+  if (xunleiTokenRefreshInProgress) return xunleiTokenRefreshInProgress;
+  xunleiTokenRefreshInProgress = generateXunleiCaptchaToken();
+  try { return await xunleiTokenRefreshInProgress; }
+  finally { xunleiTokenRefreshInProgress = null; }
+}
+
+async function checkXunleiLink(url: string): Promise<{ valid: boolean | null; reason?: string }> {
+  if (xunleiConsecutiveFailures >= XUNLEI_MAX_CONSECUTIVE_FAILURES) {
+    return { valid: null, reason: "迅雷连续失败过多，已跳过" };
+  }
+
+  try {
+    const match = url.match(/pan\.xunlei\.com\/s\/([a-zA-Z0-9_-]+)/);
+    if (!match) return { valid: false, reason: "链接格式无效" };
+    const shareId = match[1];
+    let passCode = "";
+    try { passCode = new URL(url).searchParams.get("pwd") || ""; } catch {}
+
+    const { token, deviceId } = await getXunleiCaptchaToken();
+    const apiUrl = `https://api-pan.xunlei.com/drive/v1/share?share_id=${shareId}&pass_code=${encodeURIComponent(passCode)}&limit=1&pass_code_token=&page_token=&thumbnail_size=SIZE_SMALL`;
+    const res = await fetchWithTimeout(apiUrl, {
+      headers: {
+        "x-captcha-token": token, "x-client-id": XUNLEI_CLIENT_ID, "x-device-id": deviceId,
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Origin": "https://pan.xunlei.com", "Referer": "https://pan.xunlei.com/",
+      },
+    });
+    const data = await res.json() as Record<string, unknown>;
+
+    if (data.error === "captcha_invalid") {
+      xunleiCaptchaCache.expiry = 0;
+      xunleiConsecutiveFailures++;
+      return { valid: null, reason: "captcha_invalid" };
+    }
+
+    xunleiConsecutiveFailures = 0;
+
+    if (data.share_status === "OK" || data.share_status === "PASS_CODE_EMPTY") return { valid: true };
+    return { valid: false, reason: (data.share_status as string) || (data.error_description as string) || "分享无效" };
+  } catch (error) {
+    if (error instanceof Error && error.name === "AbortError") return { valid: null, reason: "检测超时" };
+    xunleiConsecutiveFailures++;
+    return { valid: null, reason: "检查出错" };
+  }
+}
+
 async function checkLinkStatus(url: string): Promise<{ valid: boolean | null; reason?: string }> {
   try {
     if (url.includes("quark.cn")) return await checkQuarkLink(url);
     if (url.includes("pan.baidu.com") || url.includes("yun.baidu.com")) return await checkBaiduLink(url);
-    if (url.includes("pan.xunlei.com")) return { valid: null, reason: "迅雷暂不支持检测" };
+    if (url.includes("pan.xunlei.com")) return await checkXunleiLink(url);
     return { valid: null, reason: "不支持的网盘类型" };
   } catch {
     return { valid: null, reason: "检查出错" };
@@ -113,58 +215,63 @@ async function main() {
     return;
   }
 
-  console.log(`待检测: ${links.length} 条\n`);
+  const otherLinks = links.filter(l => !l.url.includes("xunlei"));
+  const xunleiLinks = links.filter(l => l.url.includes("xunlei"));
+  console.log(`待检测: ${links.length} 条 (百度/夸克: ${otherLinks.length}, 迅雷: ${xunleiLinks.length})\n`);
 
   const newlyExpiredByUser = new Map<string, { url: string; title: string | null }[]>();
   let valid = 0, expired = 0, unknown = 0, changed = 0;
 
-  for (let i = 0; i < links.length; i += CONCURRENCY) {
-    const batch = links.slice(i, i + CONCURRENCY);
-    await Promise.all(batch.map(async (link) => {
-      const result = await checkLinkStatus(link.url);
-      const newStatus = result.valid === true ? "valid" : result.valid === false ? "expired" : null;
+  async function processLink(link: typeof links[0]) {
+    const result = await checkLinkStatus(link.url);
+    const newStatus = result.valid === true ? "valid" : result.valid === false ? "expired" : "unchecked";
 
-      if (newStatus === "valid") valid++;
-      else if (newStatus === "expired") expired++;
-      else unknown++;
+    if (newStatus === "valid") valid++;
+    else if (newStatus === "expired") expired++;
+    else unknown++;
 
-      const now = new Date().toISOString();
+    const now = new Date().toISOString();
+    await supabase
+      .from("monitored_links")
+      .update({ status: newStatus, last_checked: now })
+      .eq("id", link.id);
 
-      if (newStatus) {
-        // 确认有效或失效，更新状态 + 检测时间
-        await supabase
-          .from("monitored_links")
-          .update({ status: newStatus, last_checked: now })
-          .eq("id", link.id);
+    if (newStatus === "valid" || newStatus === "expired") {
+      await supabase
+        .from("short_links")
+        .update({ status: newStatus, last_checked: now })
+        .eq("user_id", link.user_id)
+        .eq("original_url", link.url);
+    }
 
-        // 同步到 short_links
-        await supabase
-          .from("short_links")
-          .update({ status: newStatus, last_checked: now })
-          .eq("user_id", link.user_id)
-          .eq("original_url", link.url);
-      } else {
-        // 检测超时/出错，只更新检测时间，保持原状态不变
-        await supabase
-          .from("monitored_links")
-          .update({ last_checked: now })
-          .eq("id", link.id);
+    if (newStatus !== link.status) {
+      changed++;
+      const icon = newStatus === "valid" ? "✓" : newStatus === "expired" ? "✗" : "?";
+      console.log(`${icon} ${link.url.slice(0, 60)}... ${link.status} → ${newStatus}`);
+
+      if (newStatus === "expired" && link.status !== "expired") {
+        const list = newlyExpiredByUser.get(link.user_id) || [];
+        list.push({ url: link.url, title: link.title });
+        newlyExpiredByUser.set(link.user_id, list);
       }
+    }
+  }
 
-      if (newStatus && newStatus !== link.status) {
-        changed++;
-        const icon = newStatus === "valid" ? "✓" : "✗";
-        console.log(`${icon} ${link.url.slice(0, 60)}... ${link.status} → ${newStatus}`);
+  // 第一轮：百度 + 夸克（并发 10）
+  for (let i = 0; i < otherLinks.length; i += CONCURRENCY) {
+    const batch = otherLinks.slice(i, i + CONCURRENCY);
+    await Promise.all(batch.map(processLink));
+    if (i + CONCURRENCY < otherLinks.length) await new Promise((r) => setTimeout(r, 500));
+  }
 
-        if (newStatus === "expired" && link.status !== "expired") {
-          const list = newlyExpiredByUser.get(link.user_id) || [];
-          list.push({ url: link.url, title: link.title });
-          newlyExpiredByUser.set(link.user_id, list);
-        }
-      }
-    }));
-
-    if (i + CONCURRENCY < links.length) await new Promise((r) => setTimeout(r, 500));
+  // 第二轮：迅雷（并发 5）
+  if (xunleiLinks.length > 0) {
+    console.log(`\n─── 迅雷链接 (${xunleiLinks.length} 条, 并发 ${XUNLEI_CONCURRENCY}) ───\n`);
+  }
+  for (let i = 0; i < xunleiLinks.length; i += XUNLEI_CONCURRENCY) {
+    const batch = xunleiLinks.slice(i, i + XUNLEI_CONCURRENCY);
+    await Promise.all(batch.map(processLink));
+    if (i + XUNLEI_CONCURRENCY < xunleiLinks.length) await new Promise((r) => setTimeout(r, 500));
   }
 
   let emailsSent = 0;

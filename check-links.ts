@@ -1,5 +1,5 @@
 import { createClient } from "@supabase/supabase-js";
-import { createHash, createCipheriv, createDecipheriv, randomBytes } from "crypto";
+import { createHash, randomBytes } from "crypto";
 import { createTransport } from "nodemailer";
 
 const SUPABASE_URL = process.env.SUPABASE_URL!;
@@ -23,7 +23,8 @@ const CONCURRENCY = 20;
 const LINK_CHECK_TIMEOUT = 10000;
 const BATCH_UPDATE_SIZE = 500; // 每批更新 500 条
 const D1_TIMEOUT = 30000; // D1 请求超时 30 秒
-const EXCLUDED_URL_PATTERN = "%xunlei%"; // 迅雷暂不支持检测，查询阶段直接排除
+const XUNLEI_CONCURRENCY = 5;
+const XUNLEI_USES_PER_TOKEN = 30;
 
 function escapeHtml(str: string): string {
   return str.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
@@ -69,7 +70,7 @@ async function checkLinkStatus(url: string): Promise<{ valid: boolean | null; re
   try {
     if (url.includes("quark.cn")) return await checkQuarkLink(url);
     if (url.includes("pan.baidu.com") || url.includes("yun.baidu.com")) return await checkBaiduLink(url);
-    if (url.includes("pan.xunlei.com")) return { valid: null, reason: "迅雷暂不支持检测" };
+    if (url.includes("pan.xunlei.com")) return await checkXunleiLink(url);
     return { valid: null, reason: "不支持的网盘类型" };
   } catch (error) {
     if (error instanceof Error && error.name === "AbortError") return { valid: null, reason: "检测超时" };
@@ -217,9 +218,9 @@ async function checkBaiduLink(url: string): Promise<{ valid: boolean | null; rea
   }
 }
 
-// ─── 迅雷链接检测 ────────────────────────────────────────
+// ─── 迅雷链接检测（匿名方式，不需要登录账号） ──────────────
+// 常量同步自 frontend/src/lib/pan/xunlei-api.ts，更新时需同步
 
-const WORKER_URL = "https://s.panlay.com";
 const XUNLEI_CLIENT_ID = "Xqp0kJBXWhwaTpB6";
 const XUNLEI_CLIENT_VERSION = "1.92.36";
 const XUNLEI_PACKAGE_NAME = "pan.xunlei.com";
@@ -237,169 +238,61 @@ const XUNLEI_CAPTCHA_SALTS = [
   "hosGF+0Xhhr",
 ];
 
-// 凭证加解密（AES-256-GCM）
-const ENC_ALGO = "aes-256-gcm";
-const ENC_IV_LEN = 12;
-const ENC_TAG_LEN = 16;
-
-function getEncKey(): Buffer | null {
-  const key = process.env.PAN_ENCRYPTION_KEY;
-  if (!key || key.length !== 64) return null;
-  return Buffer.from(key, "hex");
-}
-
-function decryptCreds(encoded: string): string {
-  const key = getEncKey();
-  if (!key) throw new Error("PAN_ENCRYPTION_KEY not set");
-  const buf = Buffer.from(encoded, "base64");
-  const iv = buf.subarray(0, ENC_IV_LEN);
-  const tag = buf.subarray(ENC_IV_LEN, ENC_IV_LEN + ENC_TAG_LEN);
-  const ciphertext = buf.subarray(ENC_IV_LEN + ENC_TAG_LEN);
-  const decipher = createDecipheriv(ENC_ALGO, key, iv);
-  decipher.setAuthTag(tag);
-  return decipher.update(ciphertext).toString("utf8") + decipher.final("utf8");
-}
-
-function encryptCreds(plaintext: string): string {
-  const key = getEncKey();
-  if (!key) throw new Error("PAN_ENCRYPTION_KEY not set");
-  const iv = randomBytes(ENC_IV_LEN);
-  const cipher = createCipheriv(ENC_ALGO, key, iv);
-  const encrypted = Buffer.concat([cipher.update(plaintext, "utf8"), cipher.final()]);
-  const tag = cipher.getAuthTag();
-  return Buffer.concat([iv, tag, encrypted]).toString("base64");
-}
-
-// 迅雷认证状态
-interface XunleiAuthState {
-  accessToken: string;
-  captchaToken: string;
-  deviceId: string;
-  refreshToken: string;
-  dbId: string;
-  userId: string;
-  tokenExpiry: number;
-  captchaExpiry: number;
-}
-
-let xunleiAuth: XunleiAuthState | null = null;
-
 function md5(str: string): string {
   return createHash("md5").update(str).digest("hex");
 }
 
-function computeCaptchaSign(fullDeviceId: string, timestamp: string): string {
-  const shortId = fullDeviceId.replace(/^[a-z]+\d*\./, "").slice(0, 32);
-  let str = XUNLEI_CLIENT_ID + XUNLEI_CLIENT_VERSION + XUNLEI_PACKAGE_NAME + shortId + timestamp;
-  for (const salt of XUNLEI_CAPTCHA_SALTS) {
-    str = md5(str + salt);
-  }
-  return "1." + str;
-}
+let xunleiCaptchaCache = { token: "", deviceId: "", expiry: 0, uses: 0 };
+let xunleiConsecutiveFailures = 0;
+let xunleiTokenRefreshInProgress: Promise<{ token: string; deviceId: string }> | null = null;
+const XUNLEI_MAX_CONSECUTIVE_FAILURES = 5;
 
-async function refreshXunleiAccessToken(refreshToken: string) {
-  const res = await fetch(`${WORKER_URL}/xunlei/auth/token`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ client_id: XUNLEI_CLIENT_ID, grant_type: "refresh_token", refresh_token: refreshToken }),
-  });
-  const data = await res.json() as Record<string, unknown>;
-  if (!data.access_token) throw new Error(`迅雷 Token 刷新失败: ${data.error_description || "unknown"}`);
-  return {
-    accessToken: data.access_token as string,
-    refreshToken: (data.refresh_token as string) || refreshToken,
-    expiresIn: (data.expires_in as number) || 43200,
-    userId: (data.user_id as string) || (data.sub as string) || "",
-  };
-}
-
-async function refreshXunleiCaptchaToken(deviceId: string, userId: string): Promise<string> {
+async function generateXunleiCaptchaToken(): Promise<{ token: string; deviceId: string }> {
+  const deviceId = randomBytes(32).toString("hex").substring(0, 32);
   const timestamp = String(Date.now());
-  const captchaSign = computeCaptchaSign(deviceId, timestamp);
-  const res = await fetch(`${WORKER_URL}/xunlei/captcha`, {
+  let str = XUNLEI_CLIENT_ID + XUNLEI_CLIENT_VERSION + XUNLEI_PACKAGE_NAME + deviceId + timestamp;
+  for (const salt of XUNLEI_CAPTCHA_SALTS) str = md5(str + salt);
+
+  const res = await fetchWithTimeout("https://xluser-ssl.xunlei.com/v1/shield/captcha/init", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       client_id: XUNLEI_CLIENT_ID,
       action: "get:/drive/v1/files",
       device_id: deviceId,
-      meta: { package_name: XUNLEI_PACKAGE_NAME, client_version: XUNLEI_CLIENT_VERSION, captcha_sign: captchaSign, timestamp, user_id: userId || "0" },
+      meta: { package_name: XUNLEI_PACKAGE_NAME, client_version: XUNLEI_CLIENT_VERSION, captcha_sign: "1." + str, timestamp, user_id: "0" },
     }),
   });
   const data = await res.json() as Record<string, unknown>;
-  if (!data.captcha_token) { console.warn("[xunlei] captcha 获取失败:", data); return ""; }
-  return data.captcha_token as string;
+  if (!data.captcha_token) throw new Error("captcha init 失败: " + ((data.error_description as string) || (data.error as string) || "unknown"));
+
+  xunleiCaptchaCache = { token: data.captcha_token as string, deviceId, expiry: Date.now() + 240000, uses: 1 };
+  return { token: xunleiCaptchaCache.token, deviceId };
 }
 
-async function ensureXunleiAuth(): Promise<void> {
-  if (!xunleiAuth) return;
-  const now = Date.now();
-
-  // 刷新 access_token（提前 5 分钟）
-  if (!xunleiAuth.accessToken || now > xunleiAuth.tokenExpiry - 300000) {
-    const result = await refreshXunleiAccessToken(xunleiAuth.refreshToken);
-    xunleiAuth.accessToken = result.accessToken;
-    xunleiAuth.tokenExpiry = now + result.expiresIn * 1000;
-    xunleiAuth.userId = result.userId;
-
-    // 持久化轮换后的 refresh_token
-    if (result.refreshToken !== xunleiAuth.refreshToken) {
-      xunleiAuth.refreshToken = result.refreshToken;
-      const newCreds = encryptCreds(JSON.stringify({ refreshToken: result.refreshToken, deviceId: xunleiAuth.deviceId }));
-      await supabase.from("pan_accounts").update({ credentials: newCreds }).eq("id", xunleiAuth.dbId);
-      console.log("  🔄 迅雷 refresh_token 已轮换并持久化");
-    }
+async function getXunleiCaptchaToken(): Promise<{ token: string; deviceId: string }> {
+  if (xunleiCaptchaCache.token && Date.now() < xunleiCaptchaCache.expiry && xunleiCaptchaCache.uses < XUNLEI_USES_PER_TOKEN) {
+    xunleiCaptchaCache.uses++;
+    return { token: xunleiCaptchaCache.token, deviceId: xunleiCaptchaCache.deviceId };
   }
 
-  // 刷新 captcha_token（提前 30 秒）
-  if (!xunleiAuth.captchaToken || now > xunleiAuth.captchaExpiry - 30000) {
-    xunleiAuth.captchaToken = await refreshXunleiCaptchaToken(xunleiAuth.deviceId, xunleiAuth.userId);
-    xunleiAuth.captchaExpiry = now + 270000;
-  }
-}
-
-async function initXunleiAccount(): Promise<boolean> {
-  if (!getEncKey()) {
-    console.log("⚠️ PAN_ENCRYPTION_KEY 未配置，跳过迅雷链接检测");
-    return false;
-  }
-
-  const accountId = process.env.XUNLEI_CHECKER_ACCOUNT_ID || "825d60c9-6618-4448-b2fd-7d558d0dfd6c";
-  const { data, error } = await supabase.from("pan_accounts").select("id, account_id, credentials").eq("id", accountId).single();
-  if (error || !data) {
-    console.log("⚠️ 迅雷检测账号不存在，跳过迅雷链接检测");
-    return false;
-  }
-
+  // Mutex: 防止并发请求同时刷新 token
+  if (xunleiTokenRefreshInProgress) return xunleiTokenRefreshInProgress;
+  xunleiTokenRefreshInProgress = generateXunleiCaptchaToken();
   try {
-    const creds = JSON.parse(decryptCreds(data.credentials)) as { refreshToken: string; deviceId: string; accessToken?: string; tokenExpiry?: number };
-    xunleiAuth = {
-      accessToken: creds.accessToken || "",
-      captchaToken: "",
-      deviceId: creds.deviceId,
-      refreshToken: creds.refreshToken,
-      dbId: data.id,
-      userId: "",
-      tokenExpiry: creds.tokenExpiry || 0,
-      captchaExpiry: 0,
-    };
-
-    await ensureXunleiAuth();
-    console.log("✅ 迅雷检测账号已就绪");
-    return true;
-  } catch (e) {
-    console.error("⚠️ 迅雷账号初始化失败:", e);
-    xunleiAuth = null;
-    return false;
+    return await xunleiTokenRefreshInProgress;
+  } finally {
+    xunleiTokenRefreshInProgress = null;
   }
 }
 
 async function checkXunleiLink(url: string): Promise<{ valid: boolean | null; reason?: string; title?: string }> {
-  if (!xunleiAuth) return { valid: null, reason: "迅雷账号未配置" };
+  // 连续失败过多，跳过剩余迅雷链接
+  if (xunleiConsecutiveFailures >= XUNLEI_MAX_CONSECUTIVE_FAILURES) {
+    return { valid: null, reason: "迅雷连续失败过多，已跳过" };
+  }
 
   try {
-    await ensureXunleiAuth();
-
     const match = url.match(/pan\.xunlei\.com\/s\/([a-zA-Z0-9_-]+)/);
     if (!match) return { valid: false, reason: "链接格式无效" };
     const shareId = match[1];
@@ -407,34 +300,42 @@ async function checkXunleiLink(url: string): Promise<{ valid: boolean | null; re
     let passCode = "";
     try { passCode = new URL(url).searchParams.get("pwd") || ""; } catch {}
 
-    const params = new URLSearchParams({ share_id: shareId, pass_code: passCode, limit: "100" });
-    const res = await fetchWithTimeout(`${WORKER_URL}/xunlei/share/info?${params}`, {
+    const { token, deviceId } = await getXunleiCaptchaToken();
+
+    const apiUrl = `https://api-pan.xunlei.com/drive/v1/share?share_id=${shareId}&pass_code=${encodeURIComponent(passCode)}&limit=1&pass_code_token=&page_token=&thumbnail_size=SIZE_SMALL`;
+    const res = await fetchWithTimeout(apiUrl, {
       headers: {
-        "X-Xunlei-Token": xunleiAuth.accessToken,
-        "X-Xunlei-CaptchaToken": xunleiAuth.captchaToken,
-        "X-Xunlei-DeviceId": xunleiAuth.deviceId,
+        "x-captcha-token": token,
+        "x-client-id": XUNLEI_CLIENT_ID,
+        "x-device-id": deviceId,
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Origin": "https://pan.xunlei.com",
+        "Referer": "https://pan.xunlei.com/",
       },
     });
 
-    // Token 失效 → 放弃后续迅雷检测
-    if (res.status === 401) {
-      console.warn("⚠️ 迅雷 Token 失效，后续迅雷链接将跳过");
-      xunleiAuth = null;
-      return { valid: null, reason: "迅雷 Token 失效" };
-    }
-
     const data = await res.json() as Record<string, unknown>;
 
-    if (data.share_status === "OK") {
-      return { valid: true, title: (data.title as string) || undefined };
+    // captcha_invalid → 强制刷新 token，返回未知
+    if (data.error === "captcha_invalid") {
+      xunleiCaptchaCache.expiry = 0; // 强制下次刷新
+      xunleiConsecutiveFailures++;
+      return { valid: null, reason: "captcha_invalid" };
     }
-    if (data.share_status === "PASS_CODE_EMPTY") {
-      return { valid: true, title: (data.title as string) || undefined };
+
+    // 成功响应，重置连续失败计数
+    xunleiConsecutiveFailures = 0;
+
+    if (data.share_status === "OK" || data.share_status === "PASS_CODE_EMPTY") {
+      const files = data.files as Array<{ name?: string }> | undefined;
+      const title = files?.[0]?.name || undefined;
+      return { valid: true, title };
     }
 
     return { valid: false, reason: (data.share_status as string) || (data.error_description as string) || "分享无效" };
   } catch (error) {
     if (error instanceof Error && error.name === "AbortError") return { valid: null, reason: "检测超时" };
+    xunleiConsecutiveFailures++;
     console.error("Xunlei check error:", error);
     return { valid: null, reason: "检查出错" };
   }
@@ -650,9 +551,7 @@ async function main() {
   console.log("批量更新大小:", BATCH_UPDATE_SIZE);
   console.log("========================================\n");
 
-  // 初始化迅雷检测账号
-  const xunleiReady = await initXunleiAccount();
-  console.log(`迅雷检测: ${xunleiReady ? "已启用" : "已跳过"}\n`);
+  console.log("迅雷检测: 匿名模式（无需登录）\n");
 
   const allLinks: LinkToCheck[] = [];
 
@@ -704,8 +603,6 @@ async function main() {
 
           for (const row of rows) {
             if (allLinks.length >= MAX_LINKS_PER_RUN) break;
-            // 迅雷链接在代码层过滤（NOT LIKE 在 SQL 里会破坏索引效率）
-            if (row.url.includes("xunlei")) continue;
             allLinks.push({
               id: row.id,
               url: row.url,
@@ -746,7 +643,6 @@ async function main() {
           .from(table.name)
           .select(`id, user_id, title, ${table.urlField}, ${table.statusField}, ${table.checkedField}, notified_at`)
           .neq(table.statusField, "expired")
-          .not(table.urlField, "like", EXCLUDED_URL_PATTERN)
           .order(table.checkedField, { ascending: true, nullsFirst: true })
           .range(page * PAGE_SIZE, (page + 1) * PAGE_SIZE - 1);
 
@@ -782,27 +678,53 @@ async function main() {
     return new Date(a.lastChecked).getTime() - new Date(b.lastChecked).getTime();
   });
 
-  const toCheck = allLinks.slice(0, MAX_LINKS_PER_RUN);
-  console.log(`\n本次检测: ${toCheck.length} 条`);
-  console.log(`预计耗时: ${Math.ceil((toCheck.length / CONCURRENCY) * 2 / 60)} 分钟\n`);
+  // 分离迅雷链接和其他链接
+  const otherLinks = allLinks.filter(l => !l.url.includes("xunlei")).slice(0, MAX_LINKS_PER_RUN);
+  const xunleiLinks = allLinks.filter(l => l.url.includes("xunlei")).slice(0, MAX_LINKS_PER_RUN);
+  const toCheck = [...otherLinks, ...xunleiLinks];
+
+  console.log(`\n本次检测: ${toCheck.length} 条 (百度/夸克: ${otherLinks.length}, 迅雷: ${xunleiLinks.length})`);
+  if (otherLinks.length > 0) console.log(`  百度/夸克: 并发 ${CONCURRENCY}`);
+  if (xunleiLinks.length > 0) console.log(`  迅雷: 并发 ${XUNLEI_CONCURRENCY}`);
+  console.log("");
 
   if (toCheck.length === 0) { console.log("没有需要检测的链接"); return; }
 
   titleUpdated = 0;
-  let valid = 0, expired = 0, unknown = 0, errors = 0, changed = 0, skipped = 0;
+  const stats = { valid: 0, expired: 0, unknown: 0, errors: 0, changed: 0, skipped: 0 };
 
-  for (let i = 0; i < toCheck.length; i += CONCURRENCY) {
-    const batch = toCheck.slice(i, i + CONCURRENCY);
-    const results = await checkBatch(batch, i, toCheck.length);
+  function tallyResults(results: Awaited<ReturnType<typeof checkBatch>>) {
     for (const r of results) {
-      if (r.error) errors++;
-      else if (r.status === "valid") valid++;
-      else if (r.status === "expired") expired++;
-      else unknown++;
-      if (r.changed) changed++;
-      else if (!r.error) skipped++;
+      if (r.error) stats.errors++;
+      else if (r.status === "valid") stats.valid++;
+      else if (r.status === "expired") stats.expired++;
+      else stats.unknown++;
+      if (r.changed) stats.changed++;
+      else if (!r.error) stats.skipped++;
     }
-    if (i + CONCURRENCY < toCheck.length) await new Promise((r) => setTimeout(r, 500));
+  }
+
+  let processedSoFar = 0;
+
+  // 第一轮：百度 + 夸克（并发 20）
+  for (let i = 0; i < otherLinks.length; i += CONCURRENCY) {
+    const batch = otherLinks.slice(i, i + CONCURRENCY);
+    tallyResults(await checkBatch(batch, processedSoFar + i, toCheck.length));
+    if (i + CONCURRENCY < otherLinks.length) await new Promise((r) => setTimeout(r, 500));
+  }
+  processedSoFar += otherLinks.length;
+
+  await flushUpdates();
+  await flushTitles();
+
+  // 第二轮：迅雷（并发 5）
+  if (xunleiLinks.length > 0) {
+    console.log(`\n─── 迅雷链接检测 (${xunleiLinks.length} 条, 并发 ${XUNLEI_CONCURRENCY}) ───\n`);
+  }
+  for (let i = 0; i < xunleiLinks.length; i += XUNLEI_CONCURRENCY) {
+    const batch = xunleiLinks.slice(i, i + XUNLEI_CONCURRENCY);
+    tallyResults(await checkBatch(batch, processedSoFar + i, toCheck.length));
+    if (i + XUNLEI_CONCURRENCY < xunleiLinks.length) await new Promise((r) => setTimeout(r, 500));
   }
 
   // 刷新剩余的待更新数据
@@ -1066,11 +988,11 @@ async function main() {
   console.log("\n========================================");
   console.log("检测完成");
   console.log(`本次检测: ${toCheck.length} 条`);
-  console.log(`有效: ${valid} | 失效: ${expired} | 未知: ${unknown} | 错误: ${errors}`);
-  console.log(`状态变化: ${changed} | 跳过更新: ${skipped}`);
+  console.log(`有效: ${stats.valid} | 失效: ${stats.expired} | 未知: ${stats.unknown} | 错误: ${stats.errors}`);
+  console.log(`状态变化: ${stats.changed} | 跳过更新: ${stats.skipped}`);
   console.log(`标题更新: ${titleUpdated} 条默认标题被替换为真实标题`);
   console.log(`邮件通知: ${emailsSent} 封`);
-  console.log(`API 调用节省: ${skipped} 次单独更新 → ${Math.ceil(changed / BATCH_UPDATE_SIZE)} 次批量更新`);
+  console.log(`API 调用节省: ${stats.skipped} 次单独更新 → ${Math.ceil(stats.changed / BATCH_UPDATE_SIZE)} 次批量更新`);
   console.log("========================================");
 }
 
