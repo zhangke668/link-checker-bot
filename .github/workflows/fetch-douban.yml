@@ -1,0 +1,32 @@
+name: Fetch Douban
+
+on:
+  schedule:
+    - cron: '25 * * * *'   # 每小时第 25 分钟（错开 fetch-trends:05 / check-monitored:30）
+  workflow_dispatch:
+  repository_dispatch:
+    types: [fetch-douban]
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Fetch Douban snapshot
+        run: |
+          echo "Fetching Douban all categories..."
+          response=$(curl -s -w "\n%{http_code}" -X POST \
+            "https://www.panlay.com/api/cron/fetch-douban" \
+            -H "Authorization: Bearer ${{ secrets.CRON_SECRET }}" \
+            -H "Content-Type: application/json")
+
+          http_code=$(echo "$response" | tail -n1)
+          body=$(echo "$response" | sed '$d')
+
+          echo "HTTP Status: $http_code"
+          echo "Response: $body"
+
+          if [ "$http_code" != "200" ]; then
+            echo "Failed to fetch Douban snapshot"
+            exit 1
+          fi
