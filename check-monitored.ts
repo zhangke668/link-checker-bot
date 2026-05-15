@@ -182,13 +182,60 @@ async function checkXunleiLink(url: string): Promise<{ valid: boolean | null; re
   }
 }
 
-async function checkLinkStatus(url: string): Promise<{ valid: boolean | null; reason?: string }> {
+async function checkLinkStatus(url: string): Promise<{ valid: boolean | null; reason?: string; partialViolation?: boolean }> {
   try {
     if (url.includes("quark.cn")) return await checkQuarkLink(url);
+    if (url.includes("drive.uc.cn") || url.includes("fast.uc.cn")) return await checkUcLink(url);
     if (url.includes("pan.baidu.com") || url.includes("yun.baidu.com")) return await checkBaiduLink(url);
     if (url.includes("pan.xunlei.com")) return await checkXunleiLink(url);
     return { valid: null, reason: "不支持的网盘类型" };
   } catch {
+    return { valid: null, reason: "检查出错" };
+  }
+}
+
+// UC：与夸克同构；detail 用 share/sharepage/detail + _fetch_share=1，返回 share.partial_violation
+async function checkUcLink(url: string): Promise<{ valid: boolean | null; reason?: string; partialViolation?: boolean }> {
+  try {
+    const match = url.match(/\/s\/([a-zA-Z0-9]+)/);
+    if (!match) return { valid: false, reason: "链接格式无效" };
+    const pwd_id = match[1];
+    const urlObj = new URL(url);
+    const passcode = urlObj.searchParams.get("pwd") || urlObj.searchParams.get("password") || "";
+
+    const COMMON = "entry=ft&fr=pc&pr=UCBrowser";
+    const UC_HEADERS = {
+      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+      "Referer": "https://drive.uc.cn/",
+      "Origin": "https://drive.uc.cn",
+    };
+
+    const tokenUrl = `https://pc-api.uc.cn/1/clouddrive/share/sharepage/token?${COMMON}&__dt=2000&__t=${Date.now()}`;
+    const tokenRes = await fetchWithTimeout(tokenUrl, {
+      method: "POST",
+      headers: { ...UC_HEADERS, "Content-Type": "application/json" },
+      body: JSON.stringify({ pwd_id, passcode }),
+    });
+    const tokenData = await tokenRes.json() as { code: number; message?: string; data?: { stoken?: string } };
+
+    if (tokenData.code === 41003) return { valid: false, reason: "分享已过期" };
+    if (tokenData.code === 41006) return { valid: false, reason: "分享已取消" };
+    if (tokenData.code !== 0) return { valid: false, reason: tokenData.message || "链接无效" };
+
+    const stoken = tokenData.data?.stoken;
+    if (stoken) {
+      const detailUrl = `https://pc-api.uc.cn/1/clouddrive/share/sharepage/detail?${COMMON}&pwd_id=${pwd_id}&stoken=${encodeURIComponent(stoken)}&pdir_fid=0&force=0&_page=1&_size=50&_fetch_banner=1&_fetch_share=1&_fetch_total=1&_sort=file_type:asc,updated_at:desc`;
+      const detailRes = await fetchWithTimeout(detailUrl, { headers: UC_HEADERS });
+      const detailData = await detailRes.json() as { code: number; data?: { list?: unknown[]; share?: { partial_violation?: boolean } } };
+      if (detailData.code === 0) {
+        const list = detailData.data?.list || [];
+        if (list.length === 0) return { valid: false, reason: "文件已被删除" };
+        return { valid: true, partialViolation: !!detailData.data?.share?.partial_violation };
+      }
+    }
+    return { valid: true };
+  } catch (error) {
+    if (error instanceof Error && error.name === "AbortError") return { valid: null, reason: "检测超时" };
     return { valid: null, reason: "检查出错" };
   }
 }
@@ -202,7 +249,7 @@ async function main() {
   // 获取所有监控链接
   const { data: links, error } = await supabase
     .from("monitored_links")
-    .select("id, url, title, platform, status, user_id")
+    .select("id, url, title, platform, status, user_id, partial_violation")
     .order("last_checked", { ascending: true, nullsFirst: true });
 
   if (error) {
@@ -220,26 +267,34 @@ async function main() {
   console.log(`待检测: ${links.length} 条 (百度/夸克: ${otherLinks.length}, 迅雷: ${xunleiLinks.length})\n`);
 
   const newlyExpiredByUser = new Map<string, { url: string; title: string | null }[]>();
+  // 「部分文件被过滤」false → true 翻转
+  const newlyPartialByUser = new Map<string, { url: string; title: string | null }[]>();
   let valid = 0, expired = 0, unknown = 0, changed = 0;
 
   async function processLink(link: typeof links[0]) {
     const result = await checkLinkStatus(link.url);
     const newStatus = result.valid === true ? "valid" : result.valid === false ? "expired" : "unchecked";
+    const newPartial = !!result.partialViolation;
+    const oldPartial = !!link.partial_violation;
 
     if (newStatus === "valid") valid++;
     else if (newStatus === "expired") expired++;
     else unknown++;
 
     const now = new Date().toISOString();
+    const updates: Record<string, unknown> = { status: newStatus, last_checked: now };
+    if (newPartial !== oldPartial) updates.partial_violation = newPartial;
     await supabase
       .from("monitored_links")
-      .update({ status: newStatus, last_checked: now })
+      .update(updates)
       .eq("id", link.id);
 
     if (newStatus === "valid" || newStatus === "expired") {
+      const shortUpdates: Record<string, unknown> = { status: newStatus, last_checked: now };
+      if (newPartial !== oldPartial) shortUpdates.partial_violation = newPartial;
       await supabase
         .from("short_links")
-        .update({ status: newStatus, last_checked: now })
+        .update(shortUpdates)
         .eq("user_id", link.user_id)
         .eq("original_url", link.url);
     }
@@ -254,6 +309,14 @@ async function main() {
         list.push({ url: link.url, title: link.title });
         newlyExpiredByUser.set(link.user_id, list);
       }
+    }
+
+    // 部分文件被过滤翻转：false → true 入邮件队列；true → false 静默
+    if (newPartial && !oldPartial) {
+      console.log(`⚠ ${link.url.slice(0, 60)}... 触发「部分文件被过滤」`);
+      const list = newlyPartialByUser.get(link.user_id) || [];
+      list.push({ url: link.url, title: link.title });
+      newlyPartialByUser.set(link.user_id, list);
     }
   }
 
@@ -275,9 +338,9 @@ async function main() {
   }
 
   let emailsSent = 0;
-  if (newlyExpiredByUser.size > 0 && (process.env.SMTP_PASSWORD || process.env.SMTP_163_PASSWORD)) {
-    console.log(`\n📧 发送失效通知...`);
-    const userIds = [...newlyExpiredByUser.keys()];
+  if ((newlyExpiredByUser.size > 0 || newlyPartialByUser.size > 0) && (process.env.SMTP_PASSWORD || process.env.SMTP_163_PASSWORD)) {
+    console.log(`\n📧 发送通知（失效=${newlyExpiredByUser.size} 用户 / 部分过滤=${newlyPartialByUser.size} 用户）...`);
+    const userIds = [...new Set([...newlyExpiredByUser.keys(), ...newlyPartialByUser.keys()])];
     const { data: users } = await supabase
       .from("users")
       .select("id, notification_email")
@@ -330,7 +393,10 @@ async function main() {
       for (const u of users) {
         if (!u.notification_email) continue;
         const expiredLinks = newlyExpiredByUser.get(u.id);
-        if (!expiredLinks || expiredLinks.length === 0) continue;
+        if (!expiredLinks || expiredLinks.length === 0) {
+          // 没有失效链接，跳到下面 partial 循环
+          continue;
+        }
 
         const linkRows = expiredLinks
           .map((l) => `<tr><td style="padding:6px 12px;border:1px solid #eee">${escapeHtml(l.title || "未命名")}</td><td style="padding:6px 12px;border:1px solid #eee"><a href="${escapeHtml(l.url)}">${escapeHtml(l.url)}</a></td></tr>`)
@@ -388,6 +454,50 @@ async function main() {
               console.error(`  ❌ [${fallback.provider}备用] 也失败 ${u.notification_email}:`, e2);
             }
           }
+        }
+      }
+
+      // 「部分文件被过滤」邮件（false → true 翻转触发）
+      for (const u of users) {
+        if (!u.notification_email) continue;
+        const partialLinks = newlyPartialByUser.get(u.id);
+        if (!partialLinks || partialLinks.length === 0) continue;
+
+        const partialRows = partialLinks
+          .map((l) => `<tr><td style="padding:6px 12px;border:1px solid #eee">${escapeHtml(l.title || "未命名")}</td><td style="padding:6px 12px;border:1px solid #eee"><a href="${escapeHtml(l.url)}">${escapeHtml(l.url)}</a></td></tr>`)
+          .join("");
+
+        const partialHtml = `
+              <div style="font-family:sans-serif;max-width:600px;margin:0 auto">
+                <h2 style="color:#333">部分文件被过滤通知</h2>
+                <p style="color:#666">检测到以下 ${partialLinks.length} 个监控链接里部分文件已被官方过滤，访问者看到的文件会比作者上传的少，建议尽快更换：</p>
+                <table style="border-collapse:collapse;width:100%;margin:16px 0">
+                  <thead><tr style="background:#f8f8f8"><th style="padding:8px 12px;border:1px solid #eee;text-align:left">资源名称</th><th style="padding:8px 12px;border:1px solid #eee;text-align:left">链接</th></tr></thead>
+                  <tbody>${partialRows}</tbody>
+                </table>
+                <p style="color:#999;font-size:12px">此邮件由盘友助手自动发送，如不想收到通知请在链接检测页面关闭邮箱通知。</p>
+              </div>`;
+
+        const channel = pickChannel();
+        if (!channel || !channel.transporter) {
+          console.error(`  ❌ 无可用邮箱通道，跳过 ${u.notification_email}（部分过滤通知）`);
+          continue;
+        }
+
+        try {
+          await channel.transporter.sendMail({
+            from: channel.from,
+            to: u.notification_email,
+            subject: `部分文件被过滤通知 - ${partialLinks.length} 个链接`,
+            html: partialHtml,
+          });
+          emailsSent++;
+          if (channel.providerKey === "qq") qq1SentCount++;
+          else if (channel.providerKey === "qq2") qq2SentCount++;
+          await supabase.rpc("increment_email_count", { p_provider: channel.providerKey });
+          console.log(`  ✉️ [${channel.provider}] 已通知 ${u.notification_email}（${partialLinks.length} 个部分过滤链接）`);
+        } catch (e) {
+          console.error(`  ❌ [${channel.provider}] 部分过滤通知发送失败 ${u.notification_email}:`, e);
         }
       }
     }
