@@ -541,7 +541,7 @@ interface LinkToCheck {
 const newlyExpiredByUser = new Map<string, { url: string; title: string | null; linkId: string; table: string }[]>();
 
 // 新触发「部分文件被过滤」的链接按用户分组（false → true 翻转时入队）
-const newlyPartialByUser = new Map<string, { url: string; title: string | null; linkId: string }[]>();
+const newlyPartialByUser = new Map<string, { url: string; title: string | null }[]>();
 // 需要批量写回 partial_violation 列的 short_links（既包含 false→true 也包含 true→false）
 const pendingPartialUpdates: { id: string; partial: boolean }[] = [];
 
@@ -590,7 +590,7 @@ async function checkBatch(links: LinkToCheck[], startIndex: number, totalCount: 
           if (newPartial && link.userId) {
             console.log(`${progress} ⚠ [${link.table}] ${link.url.slice(0, 50)}... - 触发「部分文件被过滤」`);
             const list = newlyPartialByUser.get(link.userId) || [];
-            list.push({ url: link.url, title: link.currentTitle, linkId: link.id });
+            list.push({ url: link.url, title: link.currentTitle });
             newlyPartialByUser.set(link.userId, list);
           }
           // 同步到 monitored_links 同一 URL
@@ -888,10 +888,7 @@ async function main() {
       for (const u of users) {
         if (!u.notification_email) continue;
         const expiredLinks = newlyExpiredByUser.get(u.id);
-        if (!expiredLinks || expiredLinks.length === 0) {
-          // 该用户没有失效链接，跳过本块；partial 通知在后面的独立循环里处理
-          continue;
-        }
+        if (!expiredLinks || expiredLinks.length === 0) continue;
 
         const linkRows = expiredLinks
           .map((l) => `<tr><td style="padding:6px 12px;border:1px solid #eee">${escapeHtml(l.title || "未命名")}</td><td style="padding:6px 12px;border:1px solid #eee"><a href="${escapeHtml(l.url)}">${escapeHtml(l.url)}</a></td></tr>`)

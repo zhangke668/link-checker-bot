@@ -282,19 +282,27 @@ async function main() {
     else unknown++;
 
     const now = new Date().toISOString();
+    const partialChanged = newPartial !== oldPartial;
     const updates: Record<string, unknown> = { status: newStatus, last_checked: now };
-    if (newPartial !== oldPartial) updates.partial_violation = newPartial;
+    if (partialChanged) updates.partial_violation = newPartial;
     await supabase
       .from("monitored_links")
       .update(updates)
       .eq("id", link.id);
 
+    // 同步到 short_links：status 仅 valid/expired 时同步（unchecked 不可信）；partial 翻转无论何时都同步
     if (newStatus === "valid" || newStatus === "expired") {
       const shortUpdates: Record<string, unknown> = { status: newStatus, last_checked: now };
-      if (newPartial !== oldPartial) shortUpdates.partial_violation = newPartial;
+      if (partialChanged) shortUpdates.partial_violation = newPartial;
       await supabase
         .from("short_links")
         .update(shortUpdates)
+        .eq("user_id", link.user_id)
+        .eq("original_url", link.url);
+    } else if (partialChanged) {
+      await supabase
+        .from("short_links")
+        .update({ partial_violation: newPartial })
         .eq("user_id", link.user_id)
         .eq("original_url", link.url);
     }
