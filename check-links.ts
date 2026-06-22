@@ -66,11 +66,99 @@ async function d1Batch(items: Array<{ sql: string; params?: unknown[] }>): Promi
   if (!res.ok) throw new Error(`D1 batch failed: ${res.status} ${await res.text()}`);
 }
 
-async function checkLinkStatus(url: string): Promise<{ valid: boolean | null; reason?: string; title?: string; partialViolation?: boolean }> {
+// ─── 分享者 uk 回填 + 绑定分类（仅 baidu）──────────────────────────────
+// 本地白名单：verified_uks(盘友助手验证过) ∪ pan_accounts(当前绑定)；不在白名单的查上游 getBaiduBindLog。
+const baiduUkWhitelist = new Set<string>();
+const bindStatusCache = new Map<string, "upstream" | "external">(); // 上游结果缓存（local 直接查白名单不缓存）
+
+async function loadBaiduUkWhitelist(): Promise<void> {
+  let from = 0;
+  for (;;) {
+    const { data, error } = await supabase.from("verified_uks").select("uk").range(from, from + 999);
+    if (error) { console.error("加载 verified_uks 失败:", error.message); break; }
+    if (!data || data.length === 0) break;
+    for (const r of data) {
+      const uk = (r.uk as string) || "";
+      if (uk.startsWith("baidu:")) baiduUkWhitelist.add(uk.slice(6));
+      else if (/^\d+$/.test(uk)) baiduUkWhitelist.add(uk);
+    }
+    if (data.length < 1000) break;
+    from += 1000;
+  }
+  const { data: pa } = await supabase.from("pan_accounts").select("uk").eq("platform", "baidu").not("uk", "is", null);
+  for (const r of pa || []) if (r.uk) baiduUkWhitelist.add(r.uk as string);
+  console.log(`百度 uk 白名单已加载: ${baiduUkWhitelist.size} 个`);
+}
+
+// 匿名取分享者 uk（surl 为去掉前导 1 的短码）。失败返回 ""。
+async function fetchBaiduShareUk(surl: string): Promise<string> {
+  try {
+    const res = await fetchWithTimeout(`https://pan.baidu.com/api/shorturlinfo?app_id=250528&shorturl=1${surl}&root=1`, {
+      method: "GET",
+      headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36" },
+    });
+    const j = await res.json();
+    return j?.uk ? String(j.uk) : "";
+  } catch { return ""; }
+}
+
+// 上游绑定查询（仅给不在本地白名单的 uk 查）。true=已绑/false=未绑/null=查询失败
+async function getBaiduBindLog(uk: string): Promise<boolean | null> {
+  try {
+    const res = await fetchWithTimeout(
+      "https://yun-api.startupfun.cn/api/v1/public/external/getBaiduBindLog?appId=wx4e7537cb8fc7de5d&cp=w&ci=0000000000000&cv=1.0.0",
+      { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ secretKey: "488AJ", uk }) },
+      15000
+    );
+    const j = await res.json();
+    return j?.data === true;
+  } catch { return null; }
+}
+
+// local（本地白名单）/ upstream（盘友助手已绑）/ external（都没绑）/ null（上游查询失败，下轮重试）
+async function classifyUk(uk: string): Promise<"local" | "upstream" | "external" | null> {
+  if (baiduUkWhitelist.has(uk)) return "local";
+  const cached = bindStatusCache.get(uk);
+  if (cached) return cached;
+  const bound = await getBaiduBindLog(uk);
+  if (bound === null) return null;
+  const status = bound ? "upstream" : "external";
+  bindStatusCache.set(uk, status);
+  return status;
+}
+
+// 待回填 share_uk / uk_bind_status 缓冲
+const pendingShareUk: { ids: string[]; uks: string[]; binds: (string | null)[] } = { ids: [], uks: [], binds: [] };
+
+async function flushShareUk() {
+  if (pendingShareUk.ids.length === 0) return;
+  try {
+    const items = pendingShareUk.ids.map((id, i) => ({
+      sql: "UPDATE resources SET share_uk = ?, uk_bind_status = ? WHERE id = ?",
+      params: [pendingShareUk.uks[i], pendingShareUk.binds[i], id],
+    }));
+    await d1Batch(items);
+    console.log(`  🔖 回填 share_uk (D1): ${pendingShareUk.ids.length} 条`);
+  } catch (e) {
+    console.error(`回填 share_uk (D1) 失败 (${pendingShareUk.ids.length} 条):`, e);
+  }
+  pendingShareUk.ids = [];
+  pendingShareUk.uks = [];
+  pendingShareUk.binds = [];
+}
+
+async function queueShareUk(id: string, uk: string, bind: string | null) {
+  pendingShareUk.ids.push(id);
+  pendingShareUk.uks.push(uk);
+  pendingShareUk.binds.push(bind);
+  if (pendingShareUk.ids.length >= BATCH_UPDATE_SIZE) await flushShareUk();
+}
+
+async function checkLinkStatus(url: string, wantUk = false): Promise<{ valid: boolean | null; reason?: string; title?: string; partialViolation?: boolean; uk?: string }> {
   try {
     if (url.includes("quark.cn")) return await checkQuarkLink(url);
     if (url.includes("drive.uc.cn") || url.includes("fast.uc.cn")) return await checkUcLink(url);
-    if (url.includes("pan.baidu.com") || url.includes("yun.baidu.com")) return await checkBaiduLink(url);
+    if (url.includes("pan.baidu.com") || url.includes("yun.baidu.com")) return await checkBaiduLink(url, wantUk);
     if (url.includes("pan.xunlei.com")) return await checkXunleiLink(url);
     return { valid: null, reason: "不支持的网盘类型" };
   } catch (error) {
@@ -175,7 +263,7 @@ async function checkQuarkLink(url: string): Promise<{ valid: boolean | null; rea
   }
 }
 
-async function checkBaiduLink(url: string): Promise<{ valid: boolean | null; reason?: string; title?: string }> {
+async function checkBaiduLink(url: string, wantUk = false): Promise<{ valid: boolean | null; reason?: string; title?: string; uk?: string }> {
   try {
     const urlObj = new URL(url);
     const password = urlObj.searchParams.get("pwd") || "";
@@ -199,6 +287,9 @@ async function checkBaiduLink(url: string): Promise<{ valid: boolean | null; rea
     if (!surlMatch) return { valid: true };
     const surl = surlMatch[1];
 
+    // 仅在需要时（该资源 share_uk 未填）并行匿名取分享者 uk，失败留空不影响判定
+    const ukPromise = wantUk ? fetchBaiduShareUk(surl) : Promise.resolve(undefined);
+
     // 收集 cookies
     const cookies = step1Res.headers.getSetCookie?.() || [];
     const cookieStr = cookies.map((c: string) => c.split(";")[0]).join("; ");
@@ -218,7 +309,7 @@ async function checkBaiduLink(url: string): Promise<{ valid: boolean | null; rea
     });
 
     const step2Json = await step2Res.json();
-    if (step2Json.errno !== 0) return { valid: true };
+    if (step2Json.errno !== 0) return { valid: true, uk: await ukPromise };
 
     // 提取 BDCLND
     const newCookies = step2Res.headers.getSetCookie?.() || [];
@@ -250,10 +341,10 @@ async function checkBaiduLink(url: string): Promise<{ valid: boolean | null; rea
       let title = step3Json.title || "";
       if (title.startsWith("/")) title = title.slice(1);
       if (!title && step3Json.list?.length > 0) title = step3Json.list[0].server_filename || "";
-      return { valid: true, title: title || undefined };
+      return { valid: true, title: title || undefined, uk: await ukPromise };
     }
 
-    return { valid: true };
+    return { valid: true, uk: await ukPromise };
   } catch (error) {
     if (error instanceof Error && error.name === "AbortError") return { valid: null, reason: "检测超时" };
     console.error("Baidu check failed, fallback:", error);
@@ -535,6 +626,8 @@ interface LinkToCheck {
   notifiedAt: string | null;
   /** 仅 short_links 有此列；resources 表恒 false */
   currentPartial: boolean;
+  /** 仅 resources 表：当前 share_uk（null/空=未回填，需取分享者 uk） */
+  shareUk: string | null;
 }
 
 // 新失效链接按用户分组
@@ -550,7 +643,10 @@ async function checkBatch(links: LinkToCheck[], startIndex: number, totalCount: 
     links.map(async (link, i) => {
       const progress = `[${startIndex + i + 1}/${totalCount}]`;
       try {
-        const result = await checkLinkStatus(link.url);
+        // resources 表的百度链接、且 share_uk 未回填 → 本次顺手取分享者 uk
+        const wantUk = link.table === "resources" && !link.shareUk &&
+          (link.url.includes("pan.baidu.com") || link.url.includes("yun.baidu.com"));
+        const result = await checkLinkStatus(link.url, wantUk);
         const newStatus = result.valid === true ? "valid" : result.valid === false ? "expired" : null;
 
         if (!newStatus) {
@@ -606,6 +702,17 @@ async function checkBatch(links: LinkToCheck[], startIndex: number, totalCount: 
         // 无论状态是否变化都更新 last_checked
         await queueUpdate(link, newStatus);
 
+        // C+D：百度且 share_uk 未回填 → 存分享者 uk + 绑定分类（拿不到 uk 标 __dead__ 防重抓）
+        if (wantUk) {
+          const uk = result.uk || "";
+          if (uk) {
+            const bind = await classifyUk(uk);
+            await queueShareUk(link.id, uk, bind);
+          } else {
+            await queueShareUk(link.id, "__dead__", null);
+          }
+        }
+
         // 默认标题 + 抓到了真实标题 → 更新标题
         if (result.title && link.currentTitle && DEFAULT_TITLES.includes(link.currentTitle) && link.table === "resources") {
           await queueTitleUpdate(link.id, result.title.slice(0, 500));
@@ -627,6 +734,9 @@ async function main() {
   console.log("========================================");
   console.log("开始检测链接状态 (优化版: 跳过未变化 + 批量更新)");
   console.log("时间:", new Date().toISOString());
+
+  // 加载百度 uk 白名单（用于 share_uk 回填时分类 local/upstream/external）
+  await loadBaiduUkWhitelist();
   console.log("并发数:", CONCURRENCY);
   console.log("批量更新大小:", BATCH_UPDATE_SIZE);
   console.log("========================================\n");
@@ -658,23 +768,23 @@ async function main() {
           if (nullPhase) {
             // 查 last_checked_at 为 NULL 的（未检测过的优先），用 id 做游标
             if (nullCursorId) {
-              sql = "SELECT id, user_id, title, url, status, last_checked_at, notified_at FROM resources WHERE status = ? AND last_checked_at IS NULL AND id > ? ORDER BY id ASC LIMIT ?";
+              sql = "SELECT id, user_id, title, url, status, last_checked_at, notified_at, share_uk FROM resources WHERE status = ? AND last_checked_at IS NULL AND id > ? ORDER BY id ASC LIMIT ?";
               params = [st, nullCursorId, PAGE_SIZE];
             } else {
-              sql = "SELECT id, user_id, title, url, status, last_checked_at, notified_at FROM resources WHERE status = ? AND last_checked_at IS NULL ORDER BY id ASC LIMIT ?";
+              sql = "SELECT id, user_id, title, url, status, last_checked_at, notified_at, share_uk FROM resources WHERE status = ? AND last_checked_at IS NULL ORDER BY id ASC LIMIT ?";
               params = [st, PAGE_SIZE];
             }
           } else if (cursorTime === null) {
             // NULL 阶段结束，开始查有时间戳的，从最早的开始
-            sql = "SELECT id, user_id, title, url, status, last_checked_at, notified_at FROM resources WHERE status = ? AND last_checked_at IS NOT NULL ORDER BY last_checked_at ASC, id ASC LIMIT ?";
+            sql = "SELECT id, user_id, title, url, status, last_checked_at, notified_at, share_uk FROM resources WHERE status = ? AND last_checked_at IS NOT NULL ORDER BY last_checked_at ASC, id ASC LIMIT ?";
             params = [st, PAGE_SIZE];
           } else {
             // 游标分页：用 last_checked_at > ? 简单游标（OR 条件会破坏索引效率）
-            sql = "SELECT id, user_id, title, url, status, last_checked_at, notified_at FROM resources WHERE status = ? AND last_checked_at > ? ORDER BY last_checked_at ASC, id ASC LIMIT ?";
+            sql = "SELECT id, user_id, title, url, status, last_checked_at, notified_at, share_uk FROM resources WHERE status = ? AND last_checked_at > ? ORDER BY last_checked_at ASC, id ASC LIMIT ?";
             params = [st, cursorTime, PAGE_SIZE];
           }
 
-          const { rows } = await d1Query<{ id: string; user_id: string | null; title: string | null; url: string; status: string; last_checked_at: string | null; notified_at: string | null }>(sql, params);
+          const { rows } = await d1Query<{ id: string; user_id: string | null; title: string | null; url: string; status: string; last_checked_at: string | null; notified_at: string | null; share_uk: string | null }>(sql, params);
 
           if (!rows || rows.length === 0) {
             if (nullPhase) { nullPhase = false; continue; }
@@ -695,6 +805,7 @@ async function main() {
               currentPartial: false,
               userId: row.user_id || null,
               notifiedAt: row.notified_at || null,
+              shareUk: row.share_uk ?? null,
             });
           }
 
@@ -744,6 +855,7 @@ async function main() {
             userId: row.user_id || null,
             notifiedAt: row.notified_at || null,
             currentPartial: !!row.partial_violation,
+            shareUk: null,
           });
         }
 
@@ -798,6 +910,7 @@ async function main() {
 
   await flushUpdates();
   await flushTitles();
+  await flushShareUk();
 
   // 第二轮：迅雷（并发 5）
   if (xunleiLinks.length > 0) {
@@ -812,6 +925,7 @@ async function main() {
   // 刷新剩余的待更新数据
   await flushUpdates();
   await flushTitles();
+  await flushShareUk();
 
   // 写回 partial_violation 列翻转
   if (pendingPartialUpdates.length > 0) {
