@@ -1,5 +1,5 @@
 import { createClient } from "@supabase/supabase-js";
-import { createHash, randomBytes } from "crypto";
+import { createHash, randomBytes, randomUUID } from "crypto";
 import { createTransport } from "nodemailer";
 
 const SUPABASE_URL = process.env.SUPABASE_URL!;
@@ -67,11 +67,13 @@ async function d1Batch(items: Array<{ sql: string; params?: unknown[] }>): Promi
 }
 
 // ─── 分享者 uk 回填 + 绑定分类（仅 baidu）──────────────────────────────
-// 本地白名单：verified_uks(盘友助手验证过) ∪ pan_accounts(当前绑定)；不在白名单的查上游 getBaiduBindLog。
-const baiduUkWhitelist = new Set<string>();
-const bindStatusCache = new Map<string, "upstream" | "external">(); // 上游结果缓存（local 直接查白名单不缓存）
+// 「已绑定」名单 = verified_uks(本站验证) ∪ pan_accounts(当前绑定) ∪ baidu_uk_bound(历史查到已绑的缓存)。
+// 不在名单的才查上游 getBaiduBindLog；查到已绑就写进 baidu_uk_bound，以后任何一轮直接命中、不再查。
+const baiduBoundUks = new Set<string>();
+const externalSeenThisRun = new Set<string>(); // 本轮已确认外部的 uk，避免同轮重复查上游
 
-async function loadBaiduUkWhitelist(): Promise<void> {
+async function loadBaiduBoundUks(): Promise<void> {
+  // 1. verified_uks（本站验证过）
   let from = 0;
   for (;;) {
     const { data, error } = await supabase.from("verified_uks").select("uk").range(from, from + 999);
@@ -79,15 +81,32 @@ async function loadBaiduUkWhitelist(): Promise<void> {
     if (!data || data.length === 0) break;
     for (const r of data) {
       const uk = (r.uk as string) || "";
-      if (uk.startsWith("baidu:")) baiduUkWhitelist.add(uk.slice(6));
-      else if (/^\d+$/.test(uk)) baiduUkWhitelist.add(uk);
+      if (uk.startsWith("baidu:")) baiduBoundUks.add(uk.slice(6));
+      else if (/^\d+$/.test(uk)) baiduBoundUks.add(uk);
     }
     if (data.length < 1000) break;
     from += 1000;
   }
+  // 2. pan_accounts 当前绑定
   const { data: pa } = await supabase.from("pan_accounts").select("uk").eq("platform", "baidu").not("uk", "is", null);
-  for (const r of pa || []) if (r.uk) baiduUkWhitelist.add(r.uk as string);
-  console.log(`百度 uk 白名单已加载: ${baiduUkWhitelist.size} 个`);
+  for (const r of pa || []) if (r.uk) baiduBoundUks.add(r.uk as string);
+  // 3. baidu_uk_bound 历史已查到「已绑定」的缓存（查过的不再问上游）
+  from = 0;
+  for (;;) {
+    const { data, error } = await supabase.from("baidu_uk_bound").select("uk").range(from, from + 999);
+    if (error) { console.error("加载 baidu_uk_bound 失败:", error.message); break; }
+    if (!data || data.length === 0) break;
+    for (const r of data) if (r.uk) baiduBoundUks.add(r.uk as string);
+    if (data.length < 1000) break;
+    from += 1000;
+  }
+  console.log(`百度「已绑定」名单已加载: ${baiduBoundUks.size} 个`);
+}
+
+// 上游查到已绑 → 持久化进缓存表，以后任何一轮都直接命中、不再查上游
+async function persistBoundUk(uk: string): Promise<void> {
+  const { error } = await supabase.from("baidu_uk_bound").upsert({ uk }, { onConflict: "uk", ignoreDuplicates: true });
+  if (error) console.error("写入 baidu_uk_bound 失败:", error.message);
 }
 
 // 匿名取分享者 uk（surl 为去掉前导 1 的短码）。失败返回 ""。
@@ -115,16 +134,19 @@ async function getBaiduBindLog(uk: string): Promise<boolean | null> {
   } catch { return null; }
 }
 
-// local（本地白名单）/ upstream（盘友助手已绑）/ external（都没绑）/ null（上游查询失败，下轮重试）
-async function classifyUk(uk: string): Promise<"local" | "upstream" | "external" | null> {
-  if (baiduUkWhitelist.has(uk)) return "local";
-  const cached = bindStatusCache.get(uk);
-  if (cached) return cached;
+// bound（已绑定：本地名单或上游查到）/ external（都没绑=搬运）/ null（上游查询失败，下轮重试）
+async function classifyUk(uk: string): Promise<"bound" | "external" | null> {
+  if (baiduBoundUks.has(uk)) return "bound";
+  if (externalSeenThisRun.has(uk)) return "external";
   const bound = await getBaiduBindLog(uk);
   if (bound === null) return null;
-  const status = bound ? "upstream" : "external";
-  bindStatusCache.set(uk, status);
-  return status;
+  if (bound) {
+    baiduBoundUks.add(uk);
+    await persistBoundUk(uk);
+    return "bound";
+  }
+  externalSeenThisRun.add(uk);
+  return "external";
 }
 
 // 待回填 share_uk / uk_bind_status 缓冲
@@ -152,6 +174,40 @@ async function queueShareUk(id: string, uk: string, bind: string | null) {
   pendingShareUk.uks.push(uk);
   pendingShareUk.binds.push(bind);
   if (pendingShareUk.ids.length >= BATCH_UPDATE_SIZE) await flushShareUk();
+}
+
+// 确定未绑（external）→ 删除资源 + 投票 + 记台账（resource_reject_log）
+const pendingDelete: { id: string; url: string; uk: string; title: string | null; userId: string | null }[] = [];
+
+async function flushDeleteExternal() {
+  if (pendingDelete.length === 0) return;
+  const ids = pendingDelete.map((d) => d.id);
+  try {
+    // D1 单条 SQL 最多 100 绑定参数，删除按 80 分批（先投票后资源）
+    for (let i = 0; i < ids.length; i += 80) {
+      const chunk = ids.slice(i, i + 80);
+      const ph = chunk.map(() => "?").join(",");
+      await d1Batch([
+        { sql: `DELETE FROM resource_votes WHERE resource_id IN (${ph})`, params: chunk },
+        { sql: `DELETE FROM resources WHERE id IN (${ph})`, params: chunk },
+      ]);
+    }
+    // 台账（可追溯/可恢复）
+    const logItems = pendingDelete.map((d) => ({
+      sql: "INSERT INTO resource_reject_log (id, url, share_uk, user_id, title, reason) VALUES (?, ?, ?, ?, ?, ?)",
+      params: [randomUUID(), d.url, d.uk, d.userId, d.title, "分享者未绑定渠道（巡查自动删）"],
+    }));
+    for (let i = 0; i < logItems.length; i += 80) await d1Batch(logItems.slice(i, i + 80));
+    console.log(`  🗑 自动删除外部搬运: ${pendingDelete.length} 条`);
+  } catch (e) {
+    console.error(`自动删除外部搬运失败 (${pendingDelete.length} 条):`, e);
+  }
+  pendingDelete.length = 0;
+}
+
+async function queueDeleteExternal(id: string, url: string, uk: string, title: string | null, userId: string | null) {
+  pendingDelete.push({ id, url, uk, title, userId });
+  if (pendingDelete.length >= BATCH_UPDATE_SIZE) await flushDeleteExternal();
 }
 
 async function checkLinkStatus(url: string, wantUk = false): Promise<{ valid: boolean | null; reason?: string; title?: string; partialViolation?: boolean; uk?: string }> {
@@ -702,14 +758,21 @@ async function checkBatch(links: LinkToCheck[], startIndex: number, totalCount: 
         // 无论状态是否变化都更新 last_checked
         await queueUpdate(link, newStatus);
 
-        // C+D：百度且 share_uk 未回填 → 存分享者 uk + 绑定分类（拿不到 uk 标 __dead__ 防重抓）
+        // C+D：百度且 share_uk 未回填 → 取分享者 uk + 判绑定
         if (wantUk) {
           const uk = result.uk || "";
-          if (uk) {
-            const bind = await classifyUk(uk);
-            await queueShareUk(link.id, uk, bind);
-          } else {
+          if (!uk) {
+            // 拿不到 uk（失效/取不到）→ 标 __dead__ 防重抓；不删（不能证明未绑）
             await queueShareUk(link.id, "__dead__", null);
+          } else {
+            const bind = await classifyUk(uk); // "bound" | "external" | null
+            if (bind === "external") {
+              // 确定未绑（本地无 + 上游明确未绑）→ 自动删除 + 记台账
+              await queueDeleteExternal(link.id, link.url, uk, link.currentTitle, link.userId);
+            } else if (bind === "bound") {
+              await queueShareUk(link.id, uk, "bound");
+            }
+            // bind === null（上游查询失败）→ 不写不删，下轮重试，绝不误删
           }
         }
 
@@ -735,8 +798,8 @@ async function main() {
   console.log("开始检测链接状态 (优化版: 跳过未变化 + 批量更新)");
   console.log("时间:", new Date().toISOString());
 
-  // 加载百度 uk 白名单（用于 share_uk 回填时分类 local/upstream/external）
-  await loadBaiduUkWhitelist();
+  // 加载百度「已绑定」名单（本站 ∪ 当前绑定 ∪ 历史缓存），用于 share_uk 回填时分类 bound/external
+  await loadBaiduBoundUks();
   console.log("并发数:", CONCURRENCY);
   console.log("批量更新大小:", BATCH_UPDATE_SIZE);
   console.log("========================================\n");
@@ -911,6 +974,7 @@ async function main() {
   await flushUpdates();
   await flushTitles();
   await flushShareUk();
+  await flushDeleteExternal();
 
   // 第二轮：迅雷（并发 5）
   if (xunleiLinks.length > 0) {
@@ -926,6 +990,7 @@ async function main() {
   await flushUpdates();
   await flushTitles();
   await flushShareUk();
+  await flushDeleteExternal();
 
   // 写回 partial_violation 列翻转
   if (pendingPartialUpdates.length > 0) {
