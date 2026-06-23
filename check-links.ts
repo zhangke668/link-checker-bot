@@ -759,12 +759,11 @@ async function checkBatch(links: LinkToCheck[], startIndex: number, totalCount: 
         await queueUpdate(link, newStatus);
 
         // C+D：百度且 share_uk 未回填 → 取分享者 uk + 判绑定
+        // 关键：拿不到 uk（限流/失败）一律不写、下轮重试，绝不永久标记——
+        // 失效链接本身会被标 expired、不再被选中，不存在无限重试。
         if (wantUk) {
           const uk = result.uk || "";
-          if (!uk) {
-            // 拿不到 uk（失效/取不到）→ 标 __dead__ 防重抓；不删（不能证明未绑）
-            await queueShareUk(link.id, "__dead__", null);
-          } else {
+          if (uk) {
             const bind = await classifyUk(uk); // "bound" | "external" | null
             if (bind === "external") {
               // 确定未绑（本地无 + 上游明确未绑）→ 自动删除 + 记台账
@@ -774,6 +773,7 @@ async function checkBatch(links: LinkToCheck[], startIndex: number, totalCount: 
             }
             // bind === null（上游查询失败）→ 不写不删，下轮重试，绝不误删
           }
+          // uk 为空（限流/取不到）→ 不写，下轮重试
         }
 
         // 默认标题 + 抓到了真实标题 → 更新标题
