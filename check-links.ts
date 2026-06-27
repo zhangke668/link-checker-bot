@@ -44,6 +44,8 @@ async function fetchWithTimeout(url: string, options: RequestInit, timeout: numb
 const TABLES = [
   { name: "short_links", urlField: "original_url", statusField: "status", checkedField: "last_checked", rpcName: "batch_update_short_link_status" },
   { name: "resources", urlField: "url", statusField: "status", checkedField: "last_checked_at", rpcName: "batch_update_resource_status" },
+  // 链接转二维码「生成记录」（原网盘链接）：只更新状态，不发失效邮件（见下方 newlyExpiredByUser 门控）
+  { name: "qr_records", urlField: "original_url", statusField: "status", checkedField: "last_checked", rpcName: "batch_update_qr_record_status" },
 ];
 
 // D1 helper functions (resources 表已迁移到 D1)
@@ -717,7 +719,8 @@ async function checkBatch(links: LinkToCheck[], startIndex: number, totalCount: 
           console.log(`${progress} ${icon} [${link.table}] ${link.url.slice(0, 50)}... - ${link.currentStatus} → ${newStatus} (${result.reason || ""})`);
 
           // 记录新失效链接（用于邮件通知），已通知过的不再通知
-          if (newStatus === "expired" && link.userId && !link.notifiedAt) {
+          // qr_records（二维码生成记录）只更新状态、不发邮件，排除在通知队列外
+          if (newStatus === "expired" && link.userId && !link.notifiedAt && link.table !== "qr_records") {
             const list = newlyExpiredByUser.get(link.userId) || [];
             list.push({ url: link.url, title: link.currentTitle, linkId: link.id, table: link.table });
             newlyExpiredByUser.set(link.userId, list);
